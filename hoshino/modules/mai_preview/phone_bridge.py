@@ -103,8 +103,17 @@ _pending_key: Dict[str, Tuple[str, int]] = {}
 # 待渲染任务队列。每条任务是：
 #   {request_id, chart_id, diff, created_at, dispatched_at, attempts[, extra_request_ids]}
 # 由手机工作页主动来 pop，服务器不主动推。
+#
+# **取走不等于完成**：pop 只是「租出去」——给任务打一个租约（leased_until），
+# 租约到期还没收到 /api/stored 或 /api/report done，就把任务放回去让别人重做。
+# 为什么必须这样：工作页可能被系统回收、被刷新、编码崩溃，任务已经离开队列却
+# 永远出不了片。早先的实现 pop 完就删，实测一次刷新就吞掉几百条任务，
+# 批量会卡在「队列空了但还有一半没出片」的状态里干等到超时。
 _render_tasks: List[Dict[str, Any]] = []
 _render_task_lock = asyncio.Lock()
+
+# 单条任务的租约时长（秒）。手机编一支最长约 3 分钟（含下载音轨），给足余量。
+_RENDER_LEASE_S: float = 300.0
 
 # 批量预渲染任务的 request_id 前缀。pop_render_task 靠它区分
 # 「用户点播」和「后台铺量」——用户点播优先出队。
@@ -169,6 +178,18 @@ async def enqueue_render_task(chart_id: str | int, diff: int, request_id: str) -
     cid, df = str(chart_id), int(diff)
     incoming_batch = str(request_id).startswith(_BATCH_REQ_PREFIX)
     async with _render_task_lock:
+        # 已经租出去（正在手机/电脑上编）的同款任务也不要重复入队，
+        # 否则批量重启一次就会把手上正在跑的那几条又排一遍。
+        for t in _render_leased.values():
+            if str(t.get("chart_id")) != cid or int(t.get("diff", -1)) != df:
+                continue
+            same_kind = str(t.get("request_id", "")).startswith(_BATCH_REQ_PREFIX) == incoming_batch
+            if not same_kind:
+                continue
+            logger.info(f"[PhoneBridge] 该谱面正在渲染中，复用已派发的任务: "
+                        f"chart={cid} diff={df} req_id={t['request_id']}")
+            t.setdefault("extra_request_ids", []).append(request_id)
+            return t
         for t in _render_tasks:
             if t["chart_id"] != cid or int(t["diff"]) != df:
                 continue
@@ -194,16 +215,20 @@ async def enqueue_render_task(chart_id: str | int, diff: int, request_id: str) -
 
 
 async def pop_render_task() -> Optional[Dict[str, Any]]:
-    """手机工作页来取最早的一条待渲染任务（取走即移出队列）。
+    """手机工作页来取一条待渲染任务（取走即打租约，不是删除）。
 
-    刻意不保留「已派发」状态：worker 页取到任务后会立刻用 /api/report 汇报开始与结果；
-    就算它中途崩溃，服务器侧的等待者也会超时并向群里如实报错，不会静默卡住。
+    为什么改成租约而不是「取走即出队」：早先取走就删，工作页一旦被系统回收、
+    被手动刷新、或者编码 Worker 崩掉，任务就永久丢失 —— 队列显示空了，
+    但批量清单里还有一半没出片，只能干等到超时判失败。实测刷新一次工作页
+    就吞掉几百条。现在取走只是登记进 `_render_leased`，租约到期没等到
+    /api/stored 或 /api/report done 就自动放回队列重做。
 
     **优先级**：用户点播（`request_id` 不以 `batch_` 开头）永远排在批量预渲染前面。
     批量动辄两千条，一旦全塞进 FIFO，群里点一首新曲子要在队尾等几十小时 ——
     用户等不起，而预渲染本来就是「有空再铺」的后台活。所以这里按优先级取：
     先找第一条非批量的，没有才退回去取批量的。
     """
+    _reclaim_expired_leases()
     async with _render_task_lock:
         if not _render_tasks:
             return None
@@ -213,16 +238,67 @@ async def pop_render_task() -> Optional[Dict[str, Any]]:
                 picked = i
                 break
         task = _render_tasks.pop(picked)
-    task["dispatched_at"] = time.time()
-    task["attempts"] = int(task.get("attempts", 0)) + 1
-    logger.info(f"[PhoneBridge] 渲染任务已被手机工作页领取: req_id={task['request_id']}")
+        task["dispatched_at"] = time.time()
+        task["attempts"] = int(task.get("attempts", 0)) + 1
+        task["leased_until"] = time.time() + _RENDER_LEASE_S
+        _render_leased[str(task["request_id"])] = task
+    logger.info(f"[PhoneBridge] 渲染任务已被领取（租约 {int(_RENDER_LEASE_S)}s）: "
+                f"req_id={task['request_id']} 第 {task['attempts']} 次")
     return task
+
+
+# 已租出去、还没确认完成的任务：req_id -> task。租约到期会被回收回队列。
+_render_leased: Dict[str, Dict[str, Any]] = {}
+
+
+def _reclaim_expired_leases() -> int:
+    """把租约过期（拿走却没回音）的任务放回队列，返回回收条数。
+
+    典型场景：工作页被系统回收、被手动刷新、编码 Worker 崩溃。任务在
+    `_render_leased` 里挂着而手机上什么都没产出，不回收就永远丢了。
+    """
+    now = time.time()
+    back = 0
+    for req_id, task in list(_render_leased.items()):
+        if float(task.get("leased_until", 0)) > now:
+            continue
+        _render_leased.pop(req_id, None)
+        task["dispatched_at"] = 0.0
+        task["leased_until"] = 0.0
+        if _render_tasks.count(task) == 0:
+            _render_tasks.append(task)
+        back += 1
+        logger.warning(f"[PhoneBridge] 任务租约过期，放回队列重试: req_id={req_id} "
+                       f"chart={task.get('chart_id')} diff={task.get('diff')} "
+                       f"第 {task.get('attempts', 0)} 次")
+    return back
+
+
+def _finish_render_task(req_id: str) -> None:
+    """确认一条任务真的完成了：从租约表里摘掉，不再回收。"""
+    _render_leased.pop(str(req_id or ""), None)
+
+
+def _finish_render_task_by_ids(chart_id: str | int, diff: int) -> int:
+    """没带 request_id 时的兜底：按 (曲id, 槽位) 把所有租约中同款任务标记完成。
+
+    工作页的 /api/stored 会带 request_id，但手工 curl、旧版页面、以及
+    批量清单里复用同一条任务的多个 req_id 都可能不带，所以留这条兜底。
+    """
+    cid, df = str(chart_id), int(diff)
+    done = 0
+    for rid, t in list(_render_leased.items()):
+        if str(t.get("chart_id")) == cid and int(t.get("diff", -1)) == df:
+            _render_leased.pop(rid, None)
+            done += 1
+    return done
 
 
 def get_render_queue_info() -> Dict[str, Any]:
     """给 /status 用的队列概览（最多列前 20 条）。"""
     return {
         "pending": len(_render_tasks),
+        "leased": len(_render_leased),
         "tasks": [
             {"request_id": t["request_id"], "chart_id": t["chart_id"], "diff": t["diff"],
              "waited_s": round(time.time() - t["created_at"], 1)}
@@ -1953,6 +2029,9 @@ async def handle_api_report(request: web.Request) -> web.Response:
                 f"{json.dumps(extra, ensure_ascii=False)[:300]}")
 
     if phase in ("error", "failed") and req_id:
+        # 编码失败也算这条任务有了结论：从租约里摘掉，避免过期后又被放回队列
+        # 反复重试同一支必然失败的曲子。
+        _finish_render_task(req_id)
         fut = _pending_requests.get(req_id)
         if fut and not fut.done():
             fut.set_result({"status": "render_failed",
@@ -2007,6 +2086,11 @@ async def handle_api_stored(request: web.Request) -> web.Response:
 
     # 记账：手机上有这支了。批量预渲染靠这份索引跳过已完成的曲目。
     mark_archived(cid, diff_int, size)
+    # 确认任务真的完成了：从租约表摘掉，别再被回收重做
+    if req_id:
+        _finish_render_task(req_id)
+    else:
+        _finish_render_task_by_ids(cid, diff_int)
     logger.info(f"[PhoneBridge] 手机已存好成品: {name or f'{cid}_{diff_int}.mp4'} "
                 f"({size} B) @ {path or '手机存储'}")
 

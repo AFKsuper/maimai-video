@@ -178,9 +178,26 @@ def difficulty_options(entry: Optional[dict]) -> List[Tuple[int, str, str]]:
 
 
 def highest_slot(entry: Optional[dict]) -> Optional[int]:
-    """最高可用槽位；无条目/无难度返回 None。"""
+    """最高等级的那一档槽位；无条目/无难度返回 None。
+
+    「最高」按**等级数字**比（Lv.14.9 > Lv.13.2），不是按槽位号比。
+    正常谱面白 > 紫 > 红，两者结论一致；但个别曲子会出现
+    Expert 定数高于 Master 的情况，这时候用户要的显然是那个高定数的。
+    等级读不出来（比如宴谱写的是「12?」）就退回槽位号大的那个。
+    """
     opts = difficulty_options(entry)
-    return opts[-1][0] if opts else None
+    if not opts:
+        return None
+    best = None
+    for slot, _name, level in opts:
+        try:
+            lv = float(str(level).strip().rstrip("?"))
+        except (TypeError, ValueError):
+            lv = None
+        key = (lv if lv is not None else -1.0, slot)
+        if best is None or key > best[0]:
+            best = (key, slot)
+    return best[1]
 
 
 def describe_difficulty(entry: Optional[dict], slot: int) -> str:
@@ -204,7 +221,7 @@ def ensure_difficulty(entry: Optional[dict], diff: Optional[int]) -> None:
     if entry is None:
         if diff not in SLOT_COLOR:
             raise PreviewError(
-                f"没有难度 {diff}（槽位 {diff}）。可用槽位：2=绿 3=黄 4=红 5=紫 6=白 7=宴。"
+                f"没有难度 {diff}。可用：1=绿 2=黄 3=红 4=紫 5=白，宴写「宴」。"
             )
         return
     opts = difficulty_options(entry)
@@ -212,10 +229,10 @@ def ensure_difficulty(entry: Optional[dict], diff: Optional[int]) -> None:
         return
     if diff not in [s for s, _, _ in opts]:
         avail = " ".join(
-            f"{SLOT_COLOR.get(s, '')}{name}({level})".replace("  ", "")
-            for s, name, level in opts
+            f"{i}={SLOT_COLOR.get(s, '')}" if i <= 5 else "宴"
+            for i, (s, _n, _l) in enumerate(opts, 1)
         )
         title = entry.get("title", "?")
         raise PreviewError(
-            f"《{title}》没有难度 {diff}（槽位 {diff}）。可用：{avail}"
+            f"《{title}》没有这一档难度。可用：{avail}"
         )

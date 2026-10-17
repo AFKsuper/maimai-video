@@ -58,13 +58,17 @@ if on_startup is not None:
 sv_help = """谱面确认：查谱面，调 60fps 原视频
 
 用法
-  谱面确认 <曲id或别名> [难度]
-  例：谱面确认 11879 紫
+  谱面确认 <曲id或别名>          发这首最高等级的谱面
+  谱面确认 <曲id或别名> <难度>    发指定难度
+  例：谱面确认 11879              → 这首最高的那档
+      谱面确认 11879 4            → 紫（Master）
+      谱面确认 11879 紫           → 同上
 
 难度
-  绿 BASIC / 黄 ADVANCED / 红 EXPERT / 紫 MASTER / 白 Re:MASTER / 宴
-  也可以直接写数字 2-7；不写难度就取该曲最高难度。
-  曲id 可以换成 maimaiDX 别名库里的名字。
+  数字 1 2 3 4 5 = 绿 黄 红 紫 白（第几档，从上往下数）
+  也可以写 绿/黄/红/紫/白、basic/advanced/expert/master/re:master
+  宴 谱（Utage）写「宴」
+  不写难度就取该曲最高等级的那一档（有白就发白，没白就发紫，宴谱发宴）
 
 流程
   服务器有缓存，秒发；没有就向手机调预录成品；
@@ -87,7 +91,7 @@ def _credit(chart_id: Optional[str] = None) -> str:
 confirm_cmd = sv.on_prefix(["谱面确认"])
 help_cmd = sv.on_fullmatch(["帮助mai_preview"])
 
-_USAGE = "用法：谱面确认 <曲id或别名> [难度]，例：谱面确认 11879 紫"
+_USAGE = "用法：谱面确认 <曲id或别名> [难度]，例：谱面确认 11879 4（不写难度就发最高那档）"
 
 
 def _parse_args(text: str, usage: str,

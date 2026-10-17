@@ -28,23 +28,28 @@ class PreviewError(Exception):
 
 # 难度别名 -> 谱面槽位（&lv_N / &inote_N 的 N，见 maidata 原文）：
 #   2=Basic(绿) 3=Advanced(黄) 4=Expert(红) 5=Master(紫) 6=Re:Master(白) 7=宴/Utage
-# 纯数字原样透传（谱面不存在该槽位时，手机端渲染页会报可用列表）。
+#
+# 数字怎么读（群里的习惯写法）：
+#   1 2 3 4 5 = 绿 黄 红 紫 白（第几档难度，从上往下数）
+#   6 = 白、7 = 宴 保留为旧槽位直通，老用户写惯了不会被打破；
+#   纯数字落在 1-5 之外的，原样透传给手机端（那边会报可用列表）。
 DIFF_ALIASES = {
-    "2": 2, "绿": 2, "简单": 2, "basic": 2,
-    "3": 3, "黄": 3, "普通": 3, "进阶": 3, "advanced": 3,
-    "4": 4, "红": 4, "困难": 4, "expert": 4,
-    "5": 5, "紫": 5, "大师": 5, "master": 5,
-    "6": 6, "白": 6, "re": 6, "rem": 6, "remaster": 6, "re:master": 6,
+    "1": 2, "绿": 2, "简单": 2, "basic": 2,
+    "2": 3, "黄": 3, "普通": 3, "进阶": 3, "advanced": 3,
+    "3": 4, "红": 4, "困难": 4, "expert": 4,
+    "4": 5, "紫": 5, "大师": 5, "master": 5,
+    "5": 6, "白": 6, "re": 6, "rem": 6, "remaster": 6, "re:master": 6,
     "7": 7, "宴": 7, "utage": 7, "双押": 7,
 }
 
+DIFF_HINT = "1=绿 2=黄 3=红 4=紫 5=白，宴写「宴」"
+
 
 def parse_diff(token: str) -> int:
-    """难度别名 / 槽位数字 -> 槽位整数；无法识别抛 PreviewError。"""
+    """难度别名 / 档位数字 -> 槽位整数；无法识别抛 PreviewError。"""
     if not isinstance(token, str):
         raise PreviewError(
-            f"难度必须是文字或数字，收到的是 {type(token).__name__}。"
-            f"可用：绿=Basic 黄=Advanced 红=Expert 紫=Master 白=Re:Master，或槽位数字 2-7。"
+            f"难度必须是文字或数字，收到的是 {type(token).__name__}。可用：{DIFF_HINT}。"
         )
     key = token.strip().lower()
     if key in DIFF_ALIASES:
@@ -52,6 +57,5 @@ def parse_diff(token: str) -> int:
     if token.strip().isdigit():
         return int(token.strip())
     raise PreviewError(
-        f"无法识别的难度「{token}」。可用：绿=Basic 黄=Advanced 红=Expert "
-        f"紫=Master 白=Re:Master，或槽位数字 2-7。"
+        f"无法识别的难度「{token}」。可用：{DIFF_HINT}。"
     )

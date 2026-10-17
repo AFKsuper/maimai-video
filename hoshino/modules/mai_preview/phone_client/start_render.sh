@@ -37,17 +37,30 @@ echo "  落盘目录: $SAVE_DIR"
 echo "  谱面缓存: $CHART_DIR"
 
 echo "=== 2. 停掉旧实例 ==="
-OLD=$(ps -A -o PID,ARGS 2>/dev/null | grep '[r]ender_server.py' | awk '{print $1}')
+# 注意：Termux 里的 ps 是 procps 版，**不支持** `ps -A -o PID,ARGS`
+# （会报 `-A: not found`），所以直接遍历 /proc 读 cmdline，不依赖 ps 的参数。
+# 这个坑踩过：早期版本用 ps -A 判断，永远找不到旧进程，于是新进程绑不上 8777。
+find_pids() {
+    for d in /proc/[0-9]*; do
+        c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+        case "$c" in
+            *"$1"*) echo "${d#/proc/}" ;;
+        esac
+    done
+}
+
+OLD=$(find_pids render_server.py)
 if [ -n "$OLD" ]; then
     for p in $OLD; do kill "$p" 2>/dev/null; done
-    sleep 1
+    sleep 2
     for p in $OLD; do kill -9 "$p" 2>/dev/null; done
-    echo "  已清理旧进程: $OLD"
+    sleep 1
+    echo "  已清理旧实例: $OLD"
 else
-    echo "  没有旧进程"
+    echo "  没有旧实例"
 fi
 # 旧的独立 save_server.py 会占住 8780，一并请走（现在由 render_server.py 接管）
-OLDS=$(ps -A -o PID,ARGS 2>/dev/null | grep '[s]ave_server.py' | awk '{print $1}')
+OLDS=$(find_pids save_server.py)
 if [ -n "$OLDS" ]; then
     for p in $OLDS; do kill -9 "$p" 2>/dev/null; done
     echo "  已清理旧 save_server: $OLDS"
@@ -61,12 +74,33 @@ python3 -c "import py_compile; py_compile.compile('render_server.py', doraise=Tr
 }
 echo "  语法 OK"
 
-echo "=== 4. 启动 ==="
+echo "=== 4. 取桥接地址 ==="
+# 落盘后要通知服务器「这支已经存进手机」，靠的是这两个环境变量。
+# render_server.py 自己也会去读 config.json 兜底，这里再显式导出一遍，
+# 免得哪天改了文件名/路径就静默不通知了（症状：服务器 stored_count 一直是 0）。
+CFG=$SRC/phone_client/config.json
+if [ -f "$CFG" ]; then
+    HOST=$(grep -o '"server_host"[[:space:]]*:[[:space:]]*"[^"]*"' "$CFG" | sed 's/.*"\([^"]*\)".*/\1/')
+    PORT=$(grep -o '"server_port"[[:space:]]*:[[:space:]]*[0-9]*' "$CFG" | grep -o '[0-9]*$')
+    TOK=$(grep -o '"token"[[:space:]]*:[[:space:]]*"[^"]*"' "$CFG" | sed 's/.*"\([^"]*\)".*/\1/')
+    if [ -n "$HOST" ]; then
+        MAIMAI_BRIDGE_URL="http://$HOST:${PORT:-8778}"
+        MAIMAI_BRIDGE_TOKEN="$TOK"
+        export MAIMAI_BRIDGE_URL MAIMAI_BRIDGE_TOKEN
+        echo "  桥接地址: $MAIMAI_BRIDGE_URL"
+    else
+        echo "  config.json 里没读到 server_host，落盘后不会通知服务器"
+    fi
+else
+    echo "  没找到 $CFG，落盘后不会通知服务器"
+fi
+
+echo "=== 5. 启动 ==="
 termux-wake-lock 2>/dev/null
 nohup python3 render_server.py --dir "$SAVE_DIR" > "$LOG" 2>&1 &
 sleep 4
 
-echo "=== 5. 自检 ==="
+echo "=== 6. 自检 ==="
 H=$(curl -s -m 5 http://127.0.0.1:8777/healthz)
 if [ -n "$H" ]; then echo "  渲染页 8777 OK ($H)"; else echo "  渲染页 8777 没起来"; fi
 S=$(curl -s -m 5 http://127.0.0.1:8780/health)

@@ -10,10 +10,12 @@
 `WebCodecs`（硬编码），成片直接写进手机存储。服务器因此不需要 GPU、不需要
 折腾 ffmpeg 长任务，一首 3 分钟的全曲谱面大约 90 秒出片。
 
-声音是**服务器入库时补上的**：手机端只跑 `VideoEncoder`，产出的 MP4 天生没有音轨，
-服务器收到后从曲库里取对应音轨，用 `ffmpeg -c:v copy` 直接接上（画面零损、
-时长帧数不变，约 4 秒/支）。所以服务器上仍然需要一个 ffmpeg 可执行文件，
-但只在入库时跑几秒，不是渲染主力。
+声音是**手机端自己编进去的**：任务下发时服务器会带上音轨的真实地址，
+工作页经本机 `render_server.py` 的同源代理 `/audio/<id>.mp3` 拿到 mp3，
+主线程用 `OfflineAudioContext` 解成 PCM，Worker 里再编成 AAC，
+和画面一起 mux 进同一个 MP4。服务器侧还有一层 ffmpeg 兜底
+（`audio_mux.py`，`-c:v copy` 画面零损、约 4 秒/支），
+万一手机端没编出音轨就由它补上；已经带音轨的成品会被识别出来直接跳过。
 
 ---
 
@@ -36,14 +38,16 @@ QQ 群消息「谱面确认 834 紫」
 ┌───────────────────────────────────────────────┐
 │ 安卓手机（Termux + Chrome）                    │
 │  · render_server.py：8777 渲染页 + 8780 落盘   │
+│    另有同源代理 /audio/<id>.mp3（绕开 CORS）   │
 │  · Chrome 打开 worker.html，WebCodecs 逐帧编码 │
+│    主线程解 mp3 → Worker 编 AAC → 一起 mux     │
 │  · 成片写进 /sdcard/Download/maimai/           │
 │  · POST /api/stored 告诉服务器「这支在我这儿」 │
 └───────────────────────────────────────────────┘
 ```
 
-关键点：**所有跨网通信都是手机发起的出站连接**。服务器在公网、手机在 4G、
-在 NAT 后面、IP 会变，全都不影响。
+关键点：**所有跨网通信都是手机发起的出站连接**。服务器在公网、手机在家庭 WiFi
+或 4G、在 NAT 后面、IP 会变，全都不影响。
 
 ---
 
@@ -115,10 +119,12 @@ ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe
 
 其它常用项：`MP4_CACHE_MAX_MB`（缓存上限，默认 1024）、
 `PHONE_RENDER_PX/FPS/BITRATE`（输出规格，默认 720/60/4Mbps）、
-`PHONE_AUDIO_MUX_ENABLED`（是否补音轨，默认开）、`PHONE_AUDIO_BITRATE`（默认 `128k`）。
+`PHONE_AUDIO_MUX_ENABLED`（音轨总开关，默认开）、`PHONE_AUDIO_BITRATE`（兜底补轨码率，默认 `128k`）。
 
-音轨从 `data/catalog.json` 里每首歌的 `media.audio_url` 拉取，缓存在
-`cache/audio/<曲目ID>.mp3`。补音轨失败不影响入库，只是这一支没声音。
+音轨地址来自 `data/catalog.json` 里每首歌的 `media.audio_url`。
+手机端把 mp3 缓存到 `/sdcard/Download/maimai_audio/`，
+服务器兜底时缓存在 `cache/audio/<曲目ID>.mp3`。
+两处都是下一次直接命中，不会重复下载。
 
 ---
 

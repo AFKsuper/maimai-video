@@ -82,6 +82,19 @@ ASSETS_DIR = next((d for d in _CANDIDATES if os.path.isdir(d)), _CANDIDATES[0])
 # 谱面本地缓存：放 sdcard 上，Termux 重装/清数据也不会丢
 CHARTS_DIR = os.environ.get("MAIMAI_CHARTS_DIR", "/sdcard/Download/maimai_charts")
 SAVE_DIR = os.environ.get("MAIMAI_SAVE_DIR", "/sdcard/Download/maimai")
+# 音轨本地缓存：和谱面一样放 sdcard，编第二遍不用再下
+AUDIO_DIR = os.environ.get("MAIMAI_AUDIO_DIR", "/sdcard/Download/maimai_audio")
+
+# 音轨代理只允许这几个域名。渲染页跑在 http://127.0.0.1:8777 上，
+# 而音轨放在 astrodx-charts.saop.cc，对方**没有发 Access-Control-Allow-Origin**，
+# 浏览器直连会被 CORS 挡死（实测 fetch 报 "Failed to fetch"，手机 shell 里
+# curl 同一个 URL 却是 200）。所以由这个同源服务代为下载一次并落盘，
+# 页面再来取就是同源请求了。
+#
+# 白名单是必须的：这个端点本质是个「代客下载」，不限制就等于给局域网
+# 开了个任意 URL 的代理。
+AUDIO_ALLOW_HOSTS = {"astrodx-charts.saop.cc", "adxdls.saop.cc"}
+AUDIO_TIMEOUT_S = 30
 
 HTML_PORT = int(os.environ.get("MAIMAI_HTML_PORT", "8777") or "8777")
 SAVE_PORT = int(os.environ.get("MAIMAI_SAVE_PORT", "8780") or "8780")
@@ -145,6 +158,7 @@ def _load_bridge_from_config() -> None:
 # 不允许任何路径分隔符 —— 这是唯一一道防目录穿越的闸门。
 NAME_RE = re.compile(r"^[0-9]{1,12}_[0-9]{1,2}(_[^/\\:*?\"<>|]{0,80})?\.mp4$")
 CHART_RE = re.compile(r"^/charts/([0-9]{1,12})(?:\.txt|/maidata\.txt)$")
+AUDIO_RE = re.compile(r"^/audio/([0-9]{1,12})\.mp3$")
 MAX_BYTES = 512 * 1024 * 1024   # 单支上限 512MB，防止误传把盘写满
 
 MIME = {
@@ -267,6 +281,71 @@ def fetch_remote_chart(chart_id: str) -> bytes | None:
 
 
 # ---------------------------------------------------------------------------
+# 音轨：本地缓存 + 同源代理（绕开 CORS）
+# ---------------------------------------------------------------------------
+def audio_cache_path(chart_id: str) -> str:
+    return os.path.join(AUDIO_DIR, "%s.mp3" % chart_id)
+
+
+def read_local_audio(chart_id: str) -> bytes | None:
+    p = audio_cache_path(chart_id)
+    if os.path.isfile(p):
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+            if data:
+                return data
+        except OSError:
+            pass
+    return None
+
+
+def _audio_url_allowed(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    host = (parts.hostname or "").lower()
+    return host in AUDIO_ALLOW_HOSTS
+
+
+def fetch_remote_audio(chart_id: str, src: str) -> bytes | None:
+    """把音轨从远端拉一次并落盘。
+
+    `src` 由服务器随任务下发（服务器有 catalog.json，知道每首歌的音轨在哪个
+    分片目录下，手机自己猜不出来）。只接受白名单域名。
+    """
+    if not _audio_url_allowed(src):
+        log("[audio] %s 拒绝非白名单地址: %s" % (chart_id, src[:120]))
+        return None
+    try:
+        req = Request(src, headers={"User-Agent": REMOTE_UA})
+        with urlopen(req, timeout=AUDIO_TIMEOUT_S) as r:
+            if r.status != 200:
+                log("[audio] %s 远端返回 %s" % (chart_id, r.status))
+                return None
+            data = r.read()
+        if len(data) < 4096:          # 太小基本是错误页，别当音轨缓存
+            log("[audio] %s 内容过小（%d 字节），视为失败" % (chart_id, len(data)))
+            return None
+        try:
+            os.makedirs(AUDIO_DIR, exist_ok=True)
+            tmp = audio_cache_path(chart_id) + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, audio_cache_path(chart_id))
+        except OSError as e:
+            log("[audio] %s 落盘失败（不影响本次返回）: %s" % (chart_id, e))
+        log("[audio] %s 已从远端拉取并缓存（%d 字节）" % (chart_id, len(data)))
+        return data
+    except Exception as e:
+        log("[audio] %s 拉取失败: %s" % (chart_id, e))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 8777：渲染器静态服务
 # ---------------------------------------------------------------------------
 class RenderHandler(BaseHTTPRequestHandler):
@@ -353,6 +432,24 @@ class RenderHandler(BaseHTTPRequestHandler):
                 self._send_bytes(data, "text/plain; charset=utf-8")
             else:
                 self._plain(404, "chart not found")
+            return
+
+        # 音轨：本地优先，缺了按 ?src= 给的地址拉一次并缓存。
+        # 走这个端点是为了同源 —— 页面直连上游会被 CORS 挡掉。
+        m = AUDIO_RE.match(path)
+        if m:
+            chart_id = m.group(1)
+            data = read_local_audio(chart_id)
+            if not data:
+                src = (parse_qs(urlsplit(self.path).query).get("src") or [""])[0]
+                if not src:
+                    self._plain(400, "missing src")
+                    return
+                data = fetch_remote_audio(chart_id, src)
+            if data:
+                self._send_bytes(data, "audio/mpeg")
+            else:
+                self._plain(404, "audio not found")
             return
 
         # 静态文件

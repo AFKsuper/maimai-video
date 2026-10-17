@@ -206,6 +206,68 @@
     }
   }
 
+  /* ---------------- 音轨：主线程下载 + 解码，PCM 递给 Worker ----------------
+     为什么解码放在主线程：Worker 作用域里没有 AudioContext / OfflineAudioContext
+     （实测 hasAudioContext=false、hasOfflineAC=false），而 AudioDecoder 只能解裸
+     AAC/Opus 帧，解不了 mp3 容器。主线程两样都有，解成 PCM 之后交给 Worker，
+     Worker 再把它编成 AAC 塞进同一个 MP4 —— 这样成片在手机端就是带声音的，
+     不需要服务器事后补轨。
+
+     为什么音轨要经本机服务转一手：音轨放在 astrodx-charts.saop.cc，对方没发
+     Access-Control-Allow-Origin，浏览器直连必被 CORS 挡死（实测 fetch 报
+     "Failed to fetch"，同一 URL 用 curl 却是 200）。render_server.py 提供了
+     同源代理 /audio/<id>.mp3?src=...，先代下并缓存，这里再取就是同源请求。
+
+     拿不到音轨不算失败：静默降级成无声成片，服务器入库时还有一道 ffmpeg
+     补轨兜底（audio_mux.py）。 */
+  const audioCache = new Map();      // chartId -> Promise<解码结果>，同一首只解一次
+
+  function decodeAudioFile(arrayBuffer) {
+    // 固定 48kHz：AAC 编码器对 44100/48000 都支持，而 OfflineAudioContext 会在
+    // decodeAudioData 时自动重采样，省得后面还要自己算采样率。用 Offline 而不是
+    // 普通 AudioContext，是因为它不需要用户手势、也永远不会被自动播放策略挂起。
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) throw new Error('本机没有 OfflineAudioContext');
+    const ctx = new OAC(1, 1, 48000);
+    return new Promise((resolve, reject) => {
+      // 老版 Chrome 只支持回调式，新版返回 Promise，两种都兜住
+      const maybe = ctx.decodeAudioData(arrayBuffer, resolve, reject);
+      if (maybe && typeof maybe.then === 'function') maybe.then(resolve, reject);
+    });
+  }
+
+  async function loadAudio(task, audioUrl) {
+    const id = String(task.chart_id);
+    if (audioCache.has(id)) return audioCache.get(id);
+    const p = (async () => {
+      // 同源代理。src 用服务器下发的原始地址（它知道每首歌在哪个分片目录）。
+      const proxy = `/audio/${encodeURIComponent(id)}.mp3?src=${encodeURIComponent(audioUrl)}`;
+      const t0 = Date.now();
+      const r = await fetch(proxy);
+      if (!r.ok) throw new Error(`音轨下载失败 HTTP ${r.status}`);
+      const buf = await r.arrayBuffer();
+      const dlMs = Date.now() - t0;
+      // decodeAudioData 会把传入的 ArrayBuffer「取用」掉（byteLength 归零），
+      // 所以体积要在解码前记下来，否则日志会显示 0.0 MB。
+      const bytes = buf.byteLength;
+      const ab = await decodeAudioFile(buf);
+      const chans = [];
+      for (let c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+      log(`  音轨就绪 ${(bytes / 1048576).toFixed(1)} MB · ` +
+          `${ab.sampleRate}Hz ${ab.numberOfChannels}ch · ${ab.duration.toFixed(1)}s · 下载 ${dlMs}ms`);
+      return {
+        sampleRate: 48000,
+        numberOfChannels: ab.numberOfChannels,
+        durationMs: Math.round(ab.duration * 1000),
+        channels: chans,
+      };
+    })();
+    audioCache.set(id, p);
+    // 失败不要留缓存，下次还能重试
+    p.catch(() => audioCache.delete(id));
+    return p;
+  }
+
   /* ---------------- 跑一条任务 ---------------- */
   function runOneTask(task) {
     return new Promise((resolve) => {
@@ -265,6 +327,41 @@
 
       worker.onmessage = (ev) => {
         const s = ev.data || {};
+
+        // Worker 解不了 mp3（没有 AudioContext），向主线程要 PCM。
+        // 失败也要回一条，让 Worker 走无声路径而不是干等到超时。
+        if (s.type === 'need-audio') {
+          const audioUrl = (() => {
+            try { return new URL(task.url, location.href).searchParams.get('audio') || ''; }
+            catch (e) { return ''; }
+          })();
+          if (!audioUrl) {
+            worker.postMessage({ type: 'audio', reqId: s.reqId, ok: false });
+            return;
+          }
+          loadAudio(task, audioUrl).then((a) => {
+            // 复制一份再转移所有权：AudioBuffer 的 channelData 不一定可转移
+            // （Chrome 里它可能不是普通 ArrayBuffer），而且缓存里那份要留着
+            // 给同一首歌的下一次渲染复用，不能让转移把它 detach 掉。
+            const copies = a.channels.map((c) => new Float32Array(c));
+            try {
+              worker.postMessage({
+                type: 'audio', reqId: s.reqId, ok: true,
+                sampleRate: a.sampleRate,
+                numberOfChannels: a.numberOfChannels,
+                durationMs: a.durationMs,
+                channels: copies,
+              }, copies.map((c) => c.buffer));
+            } catch (e) {
+              worker.postMessage({ type: 'audio', reqId: s.reqId, ok: false, error: String(e && e.message || e) });
+            }
+          }).catch((e) => {
+            const why = String((e && e.message) || e);
+            log(`  ⚠ 音轨不可用（成片将无声）：${why}`);
+            worker.postMessage({ type: 'audio', reqId: s.reqId, ok: false, error: why });
+          });
+          return;
+        }
 
         // Worker 把编好的字节递过来，由这里（主线程、和页面同源）落盘。
         // Worker 里直接跨源 POST 到 127.0.0.1:8780 会被 CORS 挡掉。

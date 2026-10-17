@@ -1649,6 +1649,19 @@ def build_render_url(chart_id: str | int, diff: int, request_id: str = "") -> st
                   + (f"&request_id={request_id}" if request_id else ""),
         "name": name,
     }
+
+    # 音轨地址：手机不知道每首歌的音轨在哪个分片目录下（catalog.json 在服务器
+    # 上），所以由服务器查好一并下发。手机拿去之后不是直接 fetch——上游没有
+    # CORS 头，页面直连会被挡——而是交给本机 render_server.py 的同源代理
+    # /audio/<id>.mp3?src=... 代下并缓存，详见 encoder-worker.js 里的说明。
+    if getattr(cfg, "PHONE_AUDIO_MUX_ENABLED", True) and audio_mux is not None:
+        try:
+            audio_url = audio_mux.catalog_audio_url(chart_id)
+        except Exception:
+            audio_url = None
+        if audio_url:
+            q["audio"] = audio_url
+
     return f"{base}/encoder-worker.js?{urlencode(q)}"
 
 

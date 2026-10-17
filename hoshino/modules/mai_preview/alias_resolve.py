@@ -177,27 +177,40 @@ def difficulty_options(entry: Optional[dict]) -> List[Tuple[int, str, str]]:
     return [(d.get("slot", 0), d.get("name", ""), str(d.get("level", ""))) for d in ds]
 
 
-def highest_slot(entry: Optional[dict]) -> Optional[int]:
-    """最高等级的那一档槽位；无条目/无难度返回 None。
+def _level_value(level) -> Optional[float]:
+    """把定数文本转成可比较的数值（仅用于展示/排序参考，不参与选档）。
 
-    「最高」按**等级数字**比（Lv.14.9 > Lv.13.2），不是按槽位号比。
-    正常谱面白 > 紫 > 红，两者结论一致；但个别曲子会出现
-    Expert 定数高于 Master 的情况，这时候用户要的显然是那个高定数的。
-    等级读不出来（比如宴谱写的是「12?」）就退回槽位号大的那个。
+    maidata 里的定数有三种写法：`14.9`、`12+`、`12?`（宴谱常见，表示未知）。
+    `12+` 表示「12 往上一点」，记作 12.5。
+    """
+    s = str(level or "").strip()
+    if not s:
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([+\-?]?)", s)
+    if not m:
+        return None
+    try:
+        base = float(m.group(1))
+    except ValueError:
+        return None
+    if m.group(2) == "+":
+        base += 0.5
+    return base
+
+
+def highest_slot(entry: Optional[dict]) -> Optional[int]:
+    """最高难度档位的槽位；无条目/无难度返回 None。
+
+    **按槽位号取最大，不按定数比较。** 理由是玩家的直觉：
+    「最高等级」说的是最高那一档难度（有白谱就发白谱、有宴谱就发宴谱），
+    而不是「定数最大的那一档」。
+
+    官方的定数并不总是随难度递增 —— 全库有 9 首白谱的定数略低于紫谱
+    （例：11232 紫 13.8 / 白 13.7）。如果按定数取最大，这些曲子在用户
+    不写难度时会发出紫谱，而用户期待的显然是白谱。
     """
     opts = difficulty_options(entry)
-    if not opts:
-        return None
-    best = None
-    for slot, _name, level in opts:
-        try:
-            lv = float(str(level).strip().rstrip("?"))
-        except (TypeError, ValueError):
-            lv = None
-        key = (lv if lv is not None else -1.0, slot)
-        if best is None or key > best[0]:
-            best = (key, slot)
-    return best[1]
+    return opts[-1][0] if opts else None
 
 
 def describe_difficulty(entry: Optional[dict], slot: int) -> str:

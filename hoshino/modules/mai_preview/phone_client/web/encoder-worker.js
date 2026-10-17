@@ -300,7 +300,24 @@ async function run() {
                  `${(audioPcm.durationMs / 1000).toFixed(1)}s` });
   }
 
-  const totalMs = DUR_S > 0 ? Math.min(DUR_S * 1000, info.totalMs) : info.totalMs;
+  // 时长的取法（这一行决定了成片的音画是否对齐）：
+  //
+  //   谱面算出来的长度 info.totalMs 与官方音轨长度并不总是相等。
+  //   实测 11303：谱面 135.0s，音轨只有 131.0s —— 按谱面铺画面，
+  //   结尾就会多出 4 秒无声的空转画面，看的人会觉得"音画不同步"。
+  //
+  //   上游 maimai-chart-engine 的做法是以**音频为主时钟**：画面跟着音乐走。
+  //   这里照做 —— 有音轨时，成片长度就取音轨长度，画面不再跑超。
+  //   没有音轨（下载失败）时才退回谱面长度。
+  //   显式传了 dur= 参数则以它为准（那是调用方明确要求的截断）。
+  const chartMs = info.totalMs;
+  const audioMs = audioPcm ? audioPcm.durationMs : 0;
+  let totalMs = audioMs > 0 ? audioMs : chartMs;
+  if (DUR_S > 0) totalMs = Math.min(DUR_S * 1000, audioMs > 0 ? audioMs : chartMs);
+  if (audioMs > 0 && Math.abs(audioMs - chartMs) > 200) {
+    post({ note: `时长对齐：谱面 ${(chartMs / 1000).toFixed(1)}s / 音轨 ${(audioMs / 1000).toFixed(1)}s ` +
+                 `→ 成片按音轨 ${(totalMs / 1000).toFixed(1)}s` });
+  }
 
   // 先把音轨整段编成 AAC 帧收在手里，再决定 muxer 要不要声明 audio 轨。
   //

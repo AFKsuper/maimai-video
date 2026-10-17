@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>手机渲染工作页 — maimai 60fps 常驻</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#08080f; color:#e7e7ef; font:14px/1.55 system-ui,"Segoe UI",sans-serif; padding:12px; }
+  h1 { font-size:16px; margin:0 0 2px; }
+  .sub { color:#8b8ba3; font-size:12px; margin-bottom:10px; }
+  .card { background:#13131e; border:1px solid #232338; border-radius:12px; padding:12px 14px; margin-bottom:10px; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:99px; background:#6ee7a0; margin-right:6px; vertical-align:middle; }
+  .dot.off { background:#ff6b81; }
+  .dot.busy { background:#ffd166; }
+  .kv { display:flex; justify-content:space-between; font-size:12.5px; color:#a8a8c0; gap:10px; margin:2px 0; }
+  .kv b { color:#fff; font-variant-numeric:tabular-nums; text-align:right; }
+  .bar { height:8px; background:#1e1e2e; border-radius:99px; overflow:hidden; margin:8px 0 6px; }
+  .bar > i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#4f6ef7,#7d5cff); transition:width .25s; }
+  #log { font:11.5px/1.5 ui-monospace,Consolas,monospace; color:#9ad0a0; white-space:pre-wrap; word-break:break-all; max-height:280px; overflow:auto; }
+  #stage { display:none; }
+  .ok { color:#6ee7a0; }
+  button { background:#1b1b2b; color:#e7e7ef; border:1px solid #2c2c44; border-radius:8px; padding:8px 12px; font:13px inherit; cursor:pointer; }
+  .warn { color:#ffd166; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>手机渲染工作页</h1>
+  <div class="sub">打开一次就行 · 编码在 Worker 里跑，切后台、锁屏都不会停</div>
+
+  <div class="card">
+    <div class="kv"><span><span id="dot" class="dot off"></span><b id="stateText">连接中…</b></span><b id="pollText">—</b></div>
+    <div class="bar"><i id="prog"></i></div>
+    <div class="kv"><span id="curText">空闲等待任务</span><span id="detailText">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="kv"><span>编码位置</span><b class="ok">Worker（不受后台节流）</b></div>
+    <div class="kv"><span>屏幕常亮</span><b id="wakeText">—</b></div>
+    <div class="kv"><span>已完成任务</span><b id="doneText">0</b></div>
+    <div class="kv"><span>失败任务</span><b id="failText">0</b></div>
+    <div class="kv"><span>本页版本</span><b id="verText">—</b></div>
+  </div>
+
+  <div class="card">
+    <div class="kv" style="margin-bottom:8px"><span>任务日志</span><button id="clearBtn" style="padding:4px 10px;font-size:12px">清空</button></div>
+    <div id="log"></div>
+  </div>
+
+  <div id="stage"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  const qs = new URLSearchParams(location.search);
+  // 桥接服务地址：默认取手机可直达的局域网地址（与页面的 host 一致，仅换端口）
+  const DEFAULT_BRIDGE = `${location.protocol}//${location.hostname}:8778`;
+  const BRIDGE   = (qs.get('bridge') || DEFAULT_BRIDGE).replace(/\/+$/, '');
+  const TOKEN    = qs.get('token') || 'YOUR_SECRET_TOKEN';
+  const INTERVAL = Math.max(1000, Number(qs.get('interval')) || 3000);   // 空队列时的轮询间隔
+  const BUSY_GAP = Math.max(500,  Number(qs.get('busyGap'))  || 1500);  // 有任务在跑时的轮询间隔
+  const PX       = Math.max(200, Math.round(Number(qs.get('px')) || 720));
+  const FPS      = Math.max(1, Math.min(120, Math.round(Number(qs.get('fps')) || 60)));
+  const BITRATE  = Math.max(200e3, Math.round(Number(qs.get('bitrate')) || 4e6));
+  // 单条任务最长等待：Worker 里全曲编码实测约 3-4 倍实时，2:44 的曲子约 50s；给足余量。
+  const JOB_TIMEOUT_MS = Math.max(60000, Number(qs.get('jobTimeout')) || 600000);
+  // 手机本地落盘服务（save_server.py，Termux 里跑，监听 127.0.0.1:8780）。
+  // 传 save=0 可以关掉，只编码不落盘。
+  const SAVE_URL = (() => {
+    const raw = (qs.get('save') || '').trim();
+    if (['0', 'off', 'false', 'no'].includes(raw.toLowerCase())) return '';
+    if (raw && !['1', 'on', 'true', 'yes'].includes(raw.toLowerCase())) return raw;
+    return 'http://127.0.0.1:8780/save';
+  })();
+  const VERSION = 'worker-3';
+
+  const el = (id) => document.getElementById(id);
+  const logBox = el('log'), progEl = el('prog');
+  const dot = el('dot'), stateText = el('stateText'), pollText = el('pollText');
+  const curText = el('curText'), detailText = el('detailText');
+  const wakeText = el('wakeText');
+  const doneText = el('doneText'), failText = el('failText'), verText = el('verText');
+
+  let doneCount = 0, failCount = 0, busy = false;
+  let emptyPolls = 0;
+
+  function log(m) {
+    const t = new Date().toTimeString().slice(0, 8);
+    logBox.textContent += `[${t}] ${m}\n`;
+    logBox.scrollTop = logBox.scrollHeight;
+    if (logBox.textContent.length > 40000) {
+      logBox.textContent = logBox.textContent.slice(-30000);
+    }
+  }
+  el('clearBtn').onclick = () => { logBox.textContent = ''; };
+
+  function setState(kind, text) {
+    dot.className = 'dot' + (kind === 'ok' ? '' : kind === 'busy' ? ' busy' : ' off');
+    stateText.textContent = text;
+  }
+
+  /* ---------------- 屏幕常亮：Wake Lock ----------------
+     有了 Worker 之后这一条不再是「编码不停」的前提，只是让屏幕别自己灭掉，
+     方便人瞄一眼进度。拿不到也不影响任务。 */
+  let wakeLock = null;
+  async function acquireWakeLock() {
+    try {
+      if (!('wakeLock' in navigator)) { wakeText.textContent = '不支持'; return; }
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeText.textContent = '已开启';
+      wakeLock.addEventListener('release', () => { wakeText.textContent = '已释放'; });
+    } catch (e) {
+      wakeText.textContent = '未开启';
+    }
+  }
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible') {
+      if (!wakeLock || wakeLock.released) acquireWakeLock();
+    }
+  });
+
+  /* ---------------- 与服务器的通信 ---------------- */
+  async function fetchTask() {
+    const r = await fetch(`${BRIDGE}/api/task?token=${encodeURIComponent(TOKEN)}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  }
+
+  function report(payload) {
+    // 汇报失败不影响主流程：任务的成败最终由成品是否落进手机决定。
+    try {
+      fetch(`${BRIDGE}/api/report?token=${encodeURIComponent(TOKEN)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).catch(() => {});
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- 告诉服务器「这支已经躺在手机里了」 ----------------
+     服务器收到后记一笔账（stored_count 与 _archived_index.json），批量预渲染
+     才能跳过已完成的曲目、谱面确认才能直接让 Agent 把现成的传上来。
+
+     这条路刻意不依赖 render_server.py 的 MAIMAI_BRIDGE_URL 环境变量：
+     页面自己就知道 BRIDGE 和 TOKEN，落盘成功就地补一发，少一个会漏配的断点。 */
+  function notifyStored(payload) {
+    try {
+      fetch(`${BRIDGE}/api/stored?token=${encodeURIComponent(TOKEN)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        keepalive: true,
+      }).then((r) => {
+        if (!r.ok) log(`  ⚠ 上报「已存手机」失败：HTTP ${r.status}`);
+      }).catch((e) => log(`  ⚠ 上报「已存手机」失败：${e.message}`));
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- 把服务器下发的任务 URL 交给 Worker ----------------
+     服务器下发的就是 encoder-worker.js 的地址（参数已带全：id/diff/px/fps/
+     bitrate/save/notify…），这里只需要保证它是绝对地址并补一个文件名。
+    这样服务器改参数依旧生效，本页不需要跟着改。 */
+  function workerUrlFor(task) {
+    const u = new URL(task.url, location.href);
+    const p = u.searchParams;
+    const id = p.get('id') || task.chart_id;
+    const diff = p.get('diff') || task.diff;
+    if (!p.has('name')) p.set('name', `${id}_${diff}.mp4`);
+    // 画布尺寸由 Worker 内部 setSize 钉死，dpr 保持 1，免得像素面积被放大 6 倍
+    if (!p.has('dpr')) p.set('dpr', '1');
+    u.search = p.toString();
+    return u.toString();
+  }
+
+  /* ---------------- 把成品写进手机存储 ----------------
+     走 127.0.0.1:8780（save_server.py，跑在 Termux 里）——纯粹的 loopback，
+     一个字节都不出手机，也不经过服务器。Worker 里做同样的事会被 CORS 挡掉，
+     主线程这里做是同源请求，实测可通。 */
+  async function saveBlob(msg) {
+    const saveUrl = SAVE_URL;
+    if (!saveUrl) return { ok: true, path: null };   // 显式关掉落盘
+    const sep = saveUrl.includes('?') ? '&' : '?';
+    const qs = new URLSearchParams({
+      name: msg.name,
+      chart_id: String(msg.chartId),
+      diff: String(msg.diff),
+    });
+    try {
+      const r = await fetch(saveUrl + sep + qs.toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'video/mp4' },
+        body: new Blob([msg.buffer], { type: 'video/mp4' }),
+      });
+      const text = await r.text();
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch (e) { /* 非 JSON 就留原文 */ }
+      if (!r.ok || (parsed && parsed.ok === false)) {
+        return { ok: false, error: `HTTP ${r.status} ${String(text).slice(0, 120)}` };
+      }
+      return { ok: true, path: (parsed && parsed.path) || null };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  }
+
+  /* ---------------- 跑一条任务 ---------------- */
+  function runOneTask(task) {
+    return new Promise((resolve) => {
+      const t0 = Date.now();
+      const label = `${task.chart_id} 槽${task.diff}`;
+      curText.textContent = `#${task.chart_id} 槽${task.diff} 编码中`;
+      report({ request_id: task.request_id, phase: 'start', chart_id: task.chart_id, diff: task.diff });
+
+      let worker = null;
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(beat);
+        clearInterval(timer);
+        try { if (worker) worker.terminate(); } catch (e) { /* ignore */ }
+        resolve({ ok: ok });
+      };
+
+      // 编码期间本页不再轮询 /api/task，靠心跳汇报让服务器知道「工作页还在、正在忙」，
+      // 否则服务器的工作页存活判定会因为长时间没有请求而误报掉线。
+      let lastBeat = Date.now();
+      const beat = setInterval(() => {
+        if (Date.now() - lastBeat > 8000) {
+          lastBeat = Date.now();
+          report({ request_id: task.request_id, phase: 'working', chart_id: task.chart_id, diff: task.diff });
+        }
+      }, 2000);
+
+      let lastState = null;
+      const timer = setInterval(() => {
+        const s = lastState;
+        if (s) {
+          const pct = s.totalFrames ? (s.frames / s.totalFrames * 100) : 0;
+          progEl.style.width = pct.toFixed(1) + '%';
+          const secs = ((Date.now() - t0) / 1000).toFixed(0);
+          detailText.textContent = `${s.phase} ${s.frames}/${s.totalFrames} · ${secs}s`;
+        }
+        if (Date.now() - t0 > JOB_TIMEOUT_MS) {
+          failCount++; failText.textContent = failCount;
+          curText.textContent = `${label} 超时`;
+          log(`✗ ${task.chart_id} 槽${task.diff} 超过 ${(JOB_TIMEOUT_MS / 1000) | 0}s 未完成`);
+          report({ request_id: task.request_id, phase: 'error', error: 'timeout' });
+          finish(false);
+        }
+      }, 700);
+
+      try {
+        worker = new Worker(workerUrlFor(task));
+      } catch (e) {
+        failCount++; failText.textContent = failCount;
+        log(`✗ 无法创建编码 Worker：${e.message}`);
+        report({ request_id: task.request_id, phase: 'error', error: `worker spawn: ${e.message}` });
+        finish(false);
+        return;
+      }
+
+      worker.onmessage = (ev) => {
+        const s = ev.data || {};
+
+        // Worker 把编好的字节递过来，由这里（主线程、和页面同源）落盘。
+        // Worker 里直接跨源 POST 到 127.0.0.1:8780 会被 CORS 挡掉。
+        if (s.type === 'blob') {
+          saveBlob(s).then((res) => {
+            if (res.ok) {
+              const mb = ((s.buffer.byteLength || 0) / 1048576).toFixed(1);
+              log(`  已存进手机：${res.path || s.name}（${mb} MB）`);
+              // 落盘成了就立刻告诉服务器「这支有了」——这是服务器唯一能知道
+              // 手机目录里有什么的途径（它连不进手机的 8780）。
+              notifyStored({
+                request_id: task.request_id,
+                chart_id: s.chartId,
+                diff: s.diff,
+                name: s.name,
+                path: res.path || '',
+                size: (s.buffer && s.buffer.byteLength) || 0,
+              });
+            } else {
+              log(`  ⚠ 存进手机失败：${res.error}`);
+            }
+            report({
+              request_id: task.request_id,
+              phase: res.ok ? 'done' : 'error',
+              bytes: s.buffer ? s.buffer.byteLength : 0,
+              error: res.ok ? undefined : `save: ${res.error}`,
+            });
+            if (res.ok) {
+              doneCount++; doneText.textContent = doneCount;
+              curText.textContent = `${label} 完成`;
+            } else {
+              failCount++; failText.textContent = failCount;
+              curText.textContent = `${label} 存盘失败`;
+            }
+            finish(res.ok);
+          });
+          return;
+        }
+
+        if (s.note) log(`  · ${s.note}`);
+        if (s.type !== 'state') return;
+        lastState = s;
+
+        if (s.phase === 'done') {
+          // 走到这里说明这次没配置落盘（save=0），编码完就算完事
+          const mb = ((s.bytes || 0) / 1048576).toFixed(1);
+          doneCount++; doneText.textContent = doneCount;
+          curText.textContent = `${label} 完成`;
+          detailText.textContent = `${mb} MB · ${((Date.now() - t0) / 1000).toFixed(0)}s`;
+          log(`✓ ${task.chart_id}_${task.diff}.mp4 ${mb} MB`);
+          report({ request_id: task.request_id, phase: 'done', bytes: s.bytes });
+          finish(true);
+          return;
+        }
+
+        if (s.phase === 'error') {
+          failCount++; failText.textContent = failCount;
+          curText.textContent = `${label} 编码失败`;
+          detailText.textContent = String(s.error || '').slice(0, 60);
+          log(`✗ ${task.chart_id} 槽${task.diff} 编码失败：${s.error}`);
+          report({ request_id: task.request_id, phase: 'error', error: String(s.error || 'encode failed') });
+          finish(false);
+        }
+      };
+      worker.onerror = (e) => {
+        failCount++; failText.textContent = failCount;
+        const why = (e && (e.message || e.filename)) || 'worker error';
+        curText.textContent = `${label} 编码失败`;
+        log(`✗ 编码 Worker 异常：${why}`);
+        report({ request_id: task.request_id, phase: 'error', error: String(why) });
+        finish(false);
+      };
+      worker.onmessageerror = () => log('  ⚠ Worker 消息无法反序列化（忽略）');
+    });
+  }
+
+  /* ---------------- 主循环 ---------------- */
+  async function loop() {
+    let backoff = INTERVAL;
+    for (;;) {
+      if (!busy) {
+        let data = null;
+        try {
+          data = await fetchTask();
+          setState('ok', '在线待命');
+          backoff = INTERVAL;
+        } catch (e) {
+          setState('off', '连接失败');
+          pollText.textContent = `重试 ${Math.round(backoff / 1000)}s`;
+          log(`⚠ 拉取任务失败：${e.message}，${Math.round(backoff / 1000)}s 后重试`);
+          await sleep(backoff);
+          backoff = Math.min(backoff * 2, 30000);
+          continue;
+        }
+
+        emptyPolls++;
+        pollText.textContent = `已轮询 ${emptyPolls} 次`;
+
+        if (data && data.task) {
+          busy = true;
+          emptyPolls = 0;
+          setState('busy', '正在编码');
+          log(`→ 领取任务 ${data.task.chart_id} 槽${data.task.diff}（req ${String(data.task.request_id).slice(0, 18)}…）`);
+          await runOneTask(data.task);
+          busy = false;
+          curText.textContent = '空闲等待任务';
+          progEl.style.width = '0%';
+          setState('ok', '在线待命');
+          await sleep(BUSY_GAP);
+          continue;
+        }
+      }
+      await sleep(INTERVAL);
+    }
+  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /* ---------------- 启动 ---------------- */
+  verText.textContent = VERSION;
+  log('工作页启动');
+  log(`桥接地址 ${BRIDGE}`);
+  log(`编码参数 ${PX}px · ${FPS}fps · ${(BITRATE / 1e6).toFixed(1)}Mbps · 轮询 ${INTERVAL}ms`);
+  log('编码跑在 Worker 里，页面切后台不影响（实测后台可跑满全曲）。');
+  if (!window.isSecureContext) {
+    log('⚠ 当前不是安全上下文（非 https / 非 localhost）—— WebCodecs 不可用！');
+    log('  手机请通过 adb reverse 后用 http://127.0.0.1:8777/worker.html 访问。');
+  } else {
+    log('安全上下文已确认，WebCodecs 可用');
+  }
+  acquireWakeLock();
+
+  loop();
+})();
+</script>
+</body>
+</html>

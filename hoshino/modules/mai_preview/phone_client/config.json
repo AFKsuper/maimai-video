@@ -1,0 +1,22 @@
+{
+  "server_host": "YOUR_SERVER_HOST",
+  "server_port": 8778,
+  "server_ws_path": "/ws",
+  "server_upload_path": "/upload",
+  "token": "YOUR_SECRET_TOKEN",
+  "heartbeat_interval": 10,
+  "reconnect_min_delay": 1,
+  "reconnect_max_delay": 30,
+  "video_directories": [
+    "/sdcard/Download/maimai",
+    "/sdcard/maimai_videos",
+    "/sdcard/Download/maimai_videos",
+    "/sdcard/Download",
+    "~/storage/shared/Download/maimai",
+    "~/storage/shared/maimai_videos",
+    "~/storage/shared/Download",
+    "./videos"
+  ],
+  "strict_diff_match": false,
+  "log_level": "INFO"
+}

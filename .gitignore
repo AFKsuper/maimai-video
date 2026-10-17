@@ -1,0 +1,19 @@
+# 运行时产物
+__pycache__/
+*.py[cod]
+cache/
+*.log
+
+# 谱面本体（体积大、有版权，不入库；用 tools/import_data.py 自行导入）
+hoshino/modules/mai_preview/data/*/
+!hoshino/modules/mai_preview/data/catalog.json
+!hoshino/modules/mai_preview/data/id2dir.json
+
+# 手机端临时产物
+phone_client/charts/*.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

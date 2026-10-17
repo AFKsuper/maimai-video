@@ -106,6 +106,10 @@ _pending_key: Dict[str, Tuple[str, int]] = {}
 _render_tasks: List[Dict[str, Any]] = []
 _render_task_lock = asyncio.Lock()
 
+# 批量预渲染任务的 request_id 前缀。pop_render_task 靠它区分
+# 「用户点播」和「后台铺量」——用户点播优先出队。
+_BATCH_REQ_PREFIX = "batch_"
+
 # 手机工作页存活探测：worker.html 每次轮询 /api/task（哪怕队列是空的）以及
 # /api/report 都会刷新这个时间戳。超过 _WORKER_STALE_S 秒没动静就认为
 # 工作页已被关掉或被系统回收。
@@ -183,11 +187,21 @@ async def pop_render_task() -> Optional[Dict[str, Any]]:
 
     刻意不保留「已派发」状态：worker 页取到任务后会立刻用 /api/report 汇报开始与结果；
     就算它中途崩溃，服务器侧的等待者也会超时并向群里如实报错，不会静默卡住。
+
+    **优先级**：用户点播（`request_id` 不以 `batch_` 开头）永远排在批量预渲染前面。
+    批量动辄两千条，一旦全塞进 FIFO，群里点一首新曲子要在队尾等几十小时 ——
+    用户等不起，而预渲染本来就是「有空再铺」的后台活。所以这里按优先级取：
+    先找第一条非批量的，没有才退回去取批量的。
     """
     async with _render_task_lock:
         if not _render_tasks:
             return None
-        task = _render_tasks.pop(0)
+        picked = 0
+        for i, t in enumerate(_render_tasks):
+            if not str(t.get("request_id", "")).startswith(_BATCH_REQ_PREFIX):
+                picked = i
+                break
+        task = _render_tasks.pop(picked)
     task["dispatched_at"] = time.time()
     task["attempts"] = int(task.get("attempts", 0)) + 1
     logger.info(f"[PhoneBridge] 渲染任务已被手机工作页领取: req_id={task['request_id']}")

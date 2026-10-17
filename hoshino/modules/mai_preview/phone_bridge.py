@@ -1200,7 +1200,11 @@ def load_archived_index() -> Dict[str, Dict[str, Any]]:
     if not os.path.isfile(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig 而不是 utf-8：这份清单难免被人工编辑（例如剔掉某一支重做），
+        # 而 Windows PowerShell 的 `Set-Content -Encoding UTF8` 会写 BOM。
+        # 带 BOM 的文件用 utf-8 读会直接 ValueError，于是整份清单被当成空的 ——
+        # 表现就是「已存数量突然从 38 掉到 2」，然后批量把做过的一遍全重做。
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError) as e:
@@ -1277,6 +1281,79 @@ _batch_state: Dict[str, Any] = {
     "errors": [],
 }
 _batch_task: Optional[asyncio.Task] = None
+
+
+def _batch_auto_path() -> str:
+    """批量任务的「待续跑」标记文件。
+
+    为什么需要它：机器人跑在 Windows 计划任务里（登录时触发、仅交互式），
+    RDP 断线重连、系统更新、手动重启都会让进程重来一遍，内存里的批量状态
+    就没了。之前每次重启都要人工重新 POST 一次 /api/batch 才继续，很容易忘。
+
+    做法：启动批量时把参数落盘，正常跑完（或用户主动停）就删掉。
+    进程重启后如果还留着这个文件，说明是「非正常中断」，自动续跑。
+    真正的去重靠 _archived_index.json —— 已经做完的条目会被跳过，
+    所以续跑不会重编一遍。
+    """
+    return os.path.join(getattr(cfg, "MP4_CACHE_DIR", "."), "_batch_auto.json")
+
+
+def _save_batch_auto(slots, limit, item_timeout) -> None:
+    try:
+        path = _batch_auto_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "slots": slots,
+                "limit": limit,
+                "item_timeout": item_timeout,
+                "started_at": time.time(),
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"[PhoneBridge] 写入批量续跑标记失败（不影响运行）: {e}")
+
+
+def _clear_batch_auto() -> None:
+    try:
+        path = _batch_auto_path()
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.warning(f"[PhoneBridge] 清理批量续跑标记失败: {e}")
+
+
+async def resume_batch_if_needed() -> None:
+    """进程启动时检查有没有「中断的批量任务」，有就自动接上。
+
+    这解决的是「机器人一重启，两千条的批量就停在原地、没人知道」的问题。
+    """
+    path = _batch_auto_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"[PhoneBridge] 批量续跑标记损坏，已忽略: {e}")
+        _clear_batch_auto()
+        return
+
+    slots = data.get("slots")
+    limit = int(data.get("limit") or 0)
+    item_timeout = float(data.get("item_timeout") or 600.0)
+    # 给手机工作页一点上线时间：进程刚起来时它还在重连
+    for _ in range(30):
+        if is_worker_alive() or is_phone_online():
+            break
+        await asyncio.sleep(2.0)
+
+    ok, msg, count = await start_batch(
+        slots=slots, limit=limit, item_timeout=item_timeout, resume=True
+    )
+    if ok:
+        logger.info(f"[PhoneBridge] 检测到中断的批量任务，已自动续跑：{count} 条")
+    else:
+        logger.warning(f"[PhoneBridge] 批量自动续跑失败（{msg}），保留标记等下次启动再试")
 
 
 def get_batch_info() -> Dict[str, Any]:
@@ -1472,6 +1549,9 @@ async def _run_batch(manifest: List[Tuple[str, int]], item_timeout: float) -> No
         st["current"] = None
         st["finished_at"] = time.time()
         _batch_task = None
+        # 跑完了（或被主动叫停）就把续跑标记删掉；
+        # 只有进程被外部杀掉时标记才会留下来，下次启动据此自动续跑。
+        _clear_batch_auto()
         logger.info(
             f"[PhoneBridge] 批量预渲染结束：成功 {st['done']} / 跳过 {st['skipped']} / "
             f"失败 {st['failed']}（共 {st['total']}）"
@@ -1483,8 +1563,14 @@ async def start_batch(
     limit: int = 0,
     item_timeout: float = 600.0,
     skip_archived: bool = True,
+    resume: bool = False,
 ) -> Tuple[bool, str, int]:
-    """启动批量预渲染，返回 (是否启动, 说明, 清单条数)。"""
+    """启动批量预渲染，返回 (是否启动, 说明, 清单条数)。
+
+    resume=True 是进程重启后的自动续跑：此时不是用户主动发起的，
+    要额外做两件事 —— 允许清单为空（说明其实已经跑完了）、
+    不要覆盖已有的续跑标记。
+    """
     global _batch_task
     if _batch_state.get("running"):
         return False, "已经有一个批量任务在跑", 0
@@ -1495,7 +1581,14 @@ async def start_batch(
 
     manifest = build_batch_manifest(slots=slots, limit=limit, skip_archived=skip_archived)
     if not manifest:
+        if resume:
+            # 上一次其实已经跑完了，只是没走到清理标记那一步
+            _clear_batch_auto()
+            return False, "清单为空，视为已全部完成，已清理续跑标记", 0
         return False, "清单为空（要么都已在手机上，要么这些难度在曲库里不存在）", 0
+
+    if not resume:
+        _save_batch_auto(slots, limit, item_timeout)
 
     _batch_task = asyncio.get_running_loop().create_task(_run_batch(manifest, item_timeout))
     return True, "批量预渲染已启动", len(manifest)
@@ -1504,8 +1597,11 @@ async def start_batch(
 def stop_batch() -> bool:
     """请求停止批量（当前这条会跑完再停）。"""
     if not _batch_state.get("running"):
+        # 没在跑也顺手清掉续跑标记，否则下次启动会自己又跑起来
+        _clear_batch_auto()
         return False
     _batch_state["stop_requested"] = True
+    _clear_batch_auto()
     return True
 
 
@@ -2087,6 +2183,11 @@ async def start_server(host: Optional[str] = None, port: Optional[int] = None) -
             _server_site = site
             _is_running = True
             logger.info(f"[PhoneBridge] Phone Bridge 服务端已成功启动，监听于 {h}:{p}")
+            # 启动后检查有没有上次被中断的批量任务，有就自己接上（后台跑，不阻塞启动）
+            try:
+                asyncio.get_running_loop().create_task(resume_batch_if_needed())
+            except Exception as e:
+                logger.warning(f"[PhoneBridge] 挂载批量续跑检查失败: {e}")
             return True
         except OSError as e:
             await runner.cleanup()

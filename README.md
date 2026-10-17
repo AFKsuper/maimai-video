@@ -3,12 +3,17 @@
 基于 deepseek & HoshinoBot V2 的舞萌DX（maimai DX）谱面生成视频插件。
 
 在 QQ 群里发一句 `谱面确认 834 紫`，机器人就把这首歌对应难度的谱面渲染成
-**720p / 60fps / H.264 的 MP4** 发进群。
+**720p / 60fps / H.264 带音轨的 MP4** 发进群。
 
 渲染不是跑在服务器上，而是**跑在你自己的安卓手机上**：
 云服务器只负责接指令、管队列、发视频，真正的逐帧编码交给手机 Chrome 的
 `WebCodecs`（硬编码），成片直接写进手机存储。服务器因此不需要 GPU、不需要
 折腾 ffmpeg 长任务，一首 3 分钟的全曲谱面大约 90 秒出片。
+
+声音是**服务器入库时补上的**：手机端只跑 `VideoEncoder`，产出的 MP4 天生没有音轨，
+服务器收到后从曲库里取对应音轨，用 `ffmpeg -c:v copy` 直接接上（画面零损、
+时长帧数不变，约 4 秒/支）。所以服务器上仍然需要一个 ffmpeg 可执行文件，
+但只在入库时跑几秒，不是渲染主力。
 
 ---
 
@@ -49,6 +54,7 @@ hoshino/modules/mai_preview/
 ├─ mai_preview.py           Hoshino 模块入口（命令注册）
 ├─ phone_bridge.py          手机通信桥（aiohttp，8778）：任务下发/回传/记账/缓存
 ├─ render_core.py           渲染参数与难度别名
+├─ audio_mux.py             入库时给成片补音轨（ffmpeg -c:v copy）
 ├─ alias_resolve.py         曲目 ID / 别名解析
 ├─ video_verify.py          回传视频的 ffprobe 时长校验
 ├─ config.py                全部可调参数
@@ -77,8 +83,9 @@ hoshino/modules/mai_preview/
 把整个 `mai_preview` 目录放进 `hoshino/modules/`，然后在
 `hoshino/config/__bot__.py` 的 `MODULES_ON` 里加上 `'mai_preview'`。
 
-依赖：`aiohttp`（HoshinoBot 自带）、`ffmpeg`/`ffprobe`（只用于校验时长）。
-ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe'`。
+依赖：`aiohttp`（HoshinoBot 自带）、`ffmpeg`/`ffprobe`（校验时长 + 补音轨）。
+ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe'`，
+`ffprobe.exe` 与它在同一目录即可自动找到。
 
 `alias_resolve.py` 需要兄弟模块 `maimaiDX` 的别名库
 （`modules/maimaiDX/static/data/music_alias.json`）；不装也能用纯数字曲目 ID。
@@ -107,7 +114,11 @@ ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe
 `PHONE_BRIDGE_PORT` 默认 `8778`，需要在云厂商安全组放行入方向 `TCP:8778`。
 
 其它常用项：`MP4_CACHE_MAX_MB`（缓存上限，默认 1024）、
-`PHONE_RENDER_PX/FPS/BITRATE`（输出规格，默认 720/60/4Mbps）。
+`PHONE_RENDER_PX/FPS/BITRATE`（输出规格，默认 720/60/4Mbps）、
+`PHONE_AUDIO_MUX_ENABLED`（是否补音轨，默认开）、`PHONE_AUDIO_BITRATE`（默认 `128k`）。
+
+音轨从 `data/catalog.json` 里每首歌的 `media.audio_url` 拉取，缓存在
+`cache/audio/<曲目ID>.mp3`。补音轨失败不影响入库，只是这一支没声音。
 
 ---
 
@@ -129,6 +140,8 @@ ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe
 | 服务器缓存命中 | 1 秒内 |
 | 手机已预录，等它传上来 | 数秒 |
 | 手机需要现场编码 | 1–2 分钟 |
+
+产物是 **720p / 60fps / H.264 + AAC 128k 的 MP4**，音频由服务器入库时补上。
 
 `帮助mai_preview` 可以看内置说明。
 

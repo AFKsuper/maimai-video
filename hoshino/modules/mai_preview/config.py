@@ -56,7 +56,7 @@ PHONE_BRIDGE_HOST = '0.0.0.0'
 PHONE_BRIDGE_PORT = 8778                           # 手机 WebSocket 反向连接与上传端口
 PHONE_BRIDGE_TOKEN = "YOUR_SECRET_TOKEN"    # 手机端连接与鉴权密钥（与 phone_client/config.json 一致）
 # 手机访问本桥时应该用的地址。服务器在云上、手机在别处，服务器自己猜不出
-# 该用哪个地址（猜出来的是内网 10.0.0.x，手机连不上），必须在这里写死。
+# 该用哪个地址（猜出来的是内网 172.26.x.x，手机连不上），必须在这里写死。
 # 填公网 IP 或域名，不带 http:// 和端口，例如：'YOUR_SERVER_HOST'
 # 留空则退回「探测本机出口 IP」，只适用于服务器与手机同局域网的场景。
 PHONE_BRIDGE_PUBLIC_HOST = 'YOUR_SERVER_HOST'        # 阿里云 TS 服务器公网地址
@@ -81,6 +81,18 @@ PHONE_RENDER_PX = 720                              # 渲染分辨率（正方形
 PHONE_RENDER_FPS = 60                              # 帧率
 PHONE_RENDER_BITRATE = 4_000_000                   # 码率（bps）
 PHONE_RENDER_TIMEOUT_S = 900                       # 现渲染允许的最长耗时（全曲约 90 秒，留足余量）
+# ---------- 补音轨：手机只编了画面，服务器入库时把声音接上 ----------
+# 手机端 WebCodecs 那条链路只调 VideoEncoder（encoder-worker.js 里连
+# AudioEncoder 都没有），所以手机产出的 MP4 只有画面没有声音。补音轨
+# 放在服务器入库时做：一次 ffmpeg -c:v copy，4 秒左右，画面零损。
+# 音轨地址取自 data/catalog.json 的 media.audio_url，下载后缓存在
+# cache/audio/<id>.mp3，同一首反复请求只下一次。
+# 关掉它就是「静音视频」的老行为。
+PHONE_AUDIO_MUX_ENABLED = True                     # 是否给成片补音轨
+PHONE_AUDIO_BITRATE = "128k"                       # 补进去的音频码率
+PHONE_AUDIO_TIMEOUT_S = 60                         # 下载音轨的超时（秒）
+AUDIO_CACHE_DIR = os.path.join(HERE, 'cache', 'audio')   # 音轨缓存目录
+
 # ---------- 成品存哪：手机自己写盘，服务器不参与搬运 ----------
 # 渲染产物由同一个 render_server.py 的落盘端点接住，走 127.0.0.1 的 loopback ——
 # 一个字节都不出手机，也不经过服务器。

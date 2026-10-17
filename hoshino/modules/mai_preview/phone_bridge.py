@@ -60,6 +60,16 @@ try:
 except ImportError:  # 兼容极端加载方式
     import video_verify
 
+# 手机端只编画面（WebCodecs 那条链路没有 AudioEncoder），成片回传后在这里用
+# 服务器上的 ffmpeg 把音轨接上。拿不到这个模块也只是「没声音」，不影响入库。
+try:
+    from . import audio_mux
+except ImportError:  # 兼容极端加载方式
+    try:
+        import audio_mux
+    except ImportError:
+        audio_mux = None
+
 # 仅调试接口用它查「该曲最高难度」，好让 /debug/render 给出的链接和主命令一致。
 # 拿不到就退回默认槽位，不影响任何生产路径。
 try:
@@ -893,6 +903,32 @@ async def handle_upload(request: web.Request) -> web.Response:
     if upload_reason == "skipped":
         logger.info(f"[PhoneBridge] 上传视频未做时长校验（{upload_info.get('note') or '无权威时长数据'}）")
 
+    # 手机端的 WebCodecs 链路只编画面（encoder-worker.js 里没有 AudioEncoder），
+    # 所以回传的 MP4 天生没音轨。在这里用服务器上的 ffmpeg 把音轨接上去：
+    # -c:v copy，画面零损、时长帧数不变（video_verify 的时长校验仍然成立）。
+    # 放到线程里跑，别让 4 秒的 ffmpeg 卡住整个 aiohttp 事件循环。
+    # 任何失败都只是「这支没声音」，绝不阻断入库。
+    if audio_mux is not None:
+        try:
+            muxed, mux_reason, mux_info = await asyncio.to_thread(
+                audio_mux.apply_audio, target_path, chart_id)
+        except Exception as exc:      # 补音轨自身出错不能影响主链路
+            muxed, mux_reason, mux_info = False, "error", {"error": str(exc)}
+        if muxed:
+            file_bytes_written = os.path.getsize(target_path)
+            logger.info(
+                f"[PhoneBridge] 已补音轨：{os.path.basename(target_path)} "
+                f"({mux_reason}, audio={os.path.basename(str(mux_info.get('audio') or ''))}, "
+                f"size={file_bytes_written})")
+        elif mux_reason in ("already_has_audio",):
+            logger.info(f"[PhoneBridge] {os.path.basename(target_path)} 已有音轨，跳过")
+        elif mux_reason in ("disabled", "skipped"):
+            pass
+        else:
+            logger.warning(
+                f"[PhoneBridge] 补音轨失败（{mux_reason}）：{os.path.basename(target_path)} "
+                f"detail={mux_info} —— 成片仍按无声视频入库")
+
     # 唤醒等待者：先按 req_id 精准唤醒，再按 (chart_id, diff) 兜底。
     # 同一谱面可能被多个群同时请求，它们共享队列里的同一条任务，必须一起唤醒。
     result_payload = {
@@ -1518,7 +1554,7 @@ def _bridge_base_for_phone() -> str:
     """手机侧访问本桥（8778）时应该用的基地址。
 
     服务器已经搬上云，手机和它不在同一个局域网，所以这个地址不能再靠
-    「探测本机局域网 IP」猜 —— 猜出来的会是阿里云内网地址（10.0.0.x），
+    「探测本机局域网 IP」猜 —— 猜出来的会是阿里云内网地址（172.26.x.x），
     手机连不上。改用配置项 PHONE_BRIDGE_PUBLIC_HOST 明确指定公网地址或域名。
 
     没配时退回探测本机出口 IP：本机自测、或服务器与手机确实同局域网时仍可用，

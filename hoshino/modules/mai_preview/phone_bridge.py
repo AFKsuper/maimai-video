@@ -158,16 +158,27 @@ async def enqueue_render_task(chart_id: str | int, diff: int, request_id: str) -
     让它们共享同一条任务、等同一个成品文件，比重复渲染多份 60fps 视频经济得多
     （手机全曲编码要 1-2 分钟）。新来的 req_id 记进 extra_request_ids 备查。
 
+    **例外：用户点播不跟批量任务合并。** 铺量期间队列里几乎每个 (chart_id, diff)
+    都有一条 `batch_` 任务，如果点播来了就并进去，这条点播会顶着批量的身份
+    排在两千条队尾等着 —— 优先级机制等于没用。所以这里只在
+    「同类任务」之间去重：点播找点播、批量找批量。
+    多渲染一支的代价，换用户不用等几十小时，划算。
+
     返回队列里实际生效的那条任务。
     """
     cid, df = str(chart_id), int(diff)
+    incoming_batch = str(request_id).startswith(_BATCH_REQ_PREFIX)
     async with _render_task_lock:
         for t in _render_tasks:
-            if t["chart_id"] == cid and int(t["diff"]) == df:
-                logger.info(f"[PhoneBridge] 该谱面已在渲染队列中，复用已有任务: "
-                            f"chart={cid} diff={df} 原req_id={t['request_id']} 新req_id={request_id}")
-                t.setdefault("extra_request_ids", []).append(request_id)
-                return t
+            if t["chart_id"] != cid or int(t["diff"]) != df:
+                continue
+            same_kind = str(t.get("request_id", "")).startswith(_BATCH_REQ_PREFIX) == incoming_batch
+            if not same_kind:
+                continue
+            logger.info(f"[PhoneBridge] 该谱面已在渲染队列中，复用已有任务: "
+                        f"chart={cid} diff={df} 原req_id={t['request_id']} 新req_id={request_id}")
+            t.setdefault("extra_request_ids", []).append(request_id)
+            return t
         task = {
             "request_id": request_id,
             "chart_id": cid,

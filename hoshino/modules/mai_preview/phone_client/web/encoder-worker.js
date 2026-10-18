@@ -373,11 +373,11 @@ function diffRatio(a, b) {
 
 /* 预扫：在不编码的情况下把开头的画面快速渲染一遍，找出「谱面开始动」的时刻。
  * 必须先扫再编 —— 编码是不可回退的，一旦某一帧没叠提示层就补不回来了。 */
-function detectIntroEnd(api, totalMs) {
+function detectIntroEnd(api, totalMs, leadMs) {
   const limit = Math.min(totalMs, DETECT_MAX_MS);
   let baseline = null;
   for (let ms = 0; ms <= limit; ms += DETECT_STEP_MS) {
-    api.renderMs(ms);
+    api.renderMs(ms + leadMs);
     const px = grabSmall();
     if (baseline === null) {
       baseline = px;
@@ -557,6 +557,14 @@ async function run() {
                  `${(audioPcm.durationMs / 1000).toFixed(1)}s` });
   }
 
+  // render-bundle.js 会给整张谱面强制加 1 小节的开场留白（:7448-7452
+  // `const leadInMs = 6e4 * 4 / parseResult.firstBpm; note.timing += 4; note.timingMs += leadInMs;`）。
+  // 那是给网页播放器留的画面准备期：网页里音乐也从 leadInMs 之后才开始排。
+  // 但我们喂进去的音轨是官方 mp3，从 0 秒就开始了（开头自带的静音由曲子本身决定）。
+  // 结果就是画面整体比音乐晚一小节 —— BPM 183 时 1311ms，正是用户听到的「音乐先响」。
+  // 所以这里把渲染时钟整体往前推 leadMs，让谱面回到它自己的时间轴上。
+  const leadMs = info.bpm > 0 ? (6e4 * 4) / info.bpm : 0;
+
   // 时长的取法（这一行决定了成片的音画是否对齐）：
   //
   //   谱面算出来的长度 info.totalMs 与官方音轨长度并不总是相等。
@@ -698,14 +706,15 @@ async function run() {
   // 空场期到哪儿结束：先在不编码的情况下快速预扫一遍，找出「谱面开始动」的时刻。
   // 检测不到（整支都没音符）就返回 0，行为与改动前完全一致。
   setPhase('scanning');
-  const introEndMs = detectIntroEnd(api, totalMs);
+  const introEndMs = detectIntroEnd(api, totalMs, leadMs);
 
   for (let i = 0; i < totalFrames; i++) {
     if (encErr) throw encErr;
 
     const tMs = i * 1000 / FPS;
     const tr = performance.now();
-    api.renderMs(tMs);
+    // 音轨从 0 开始铺，所以画面也要从谱面自己的 0 时刻开始 —— 补回 bundle 强加的开场留白。
+    api.renderMs(tMs + leadMs);
     // 提示层叠在同一个 canvas 上，必须在 renderMs 之后、new VideoFrame 之前
     if (introEndMs > 0 && tMs < introEndMs) drawIntroOverlay(tMs, introEndMs);
     renderAcc += performance.now() - tr;

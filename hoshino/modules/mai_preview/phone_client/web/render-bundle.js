@@ -8390,6 +8390,34 @@
         totalMs: totalMsOf(chart),
         firstMs: Number.isFinite(chart.firstMs) ? chart.firstMs : 0
       };
+    },
+    /** 本地扩展：返回所有「要打点的命中时刻」（毫秒，已含 4 拍前导）。
+     *  供离线编码器叠正解音用 —— 直接复用这里的解析结果，避免上层再解析一遍
+     *  谱面导致两边时刻对不上。hold 尾判 / slide 尾判不产生正解音，故不计入。 */
+    hitTimes() {
+      if (!chart || !chart.notes) return null;
+      const out = [];
+      for (const n of chart.notes) {
+        if (!n || !Number.isFinite(n.timingMs)) continue;
+        if (n.type === "slide") {
+          // 无头滑条（! / ? 开头）头部不打点，这里不计
+          if (!n.isHeadless) out.push(n.timingMs);
+          continue;
+        }
+        switch (n.type) {
+          case "tap":
+          case "break":
+          case "simultaneous":
+          case "touch":
+          case "hold-start":
+          case "hold-start-simultaneous":
+          case "touch-hold-start":
+            out.push(n.timingMs);
+            break;
+        }
+      }
+      out.sort((a2, b2) => a2 - b2);
+      return out;
     }
   };
   window.__chartPreview = api;

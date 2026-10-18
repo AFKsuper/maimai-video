@@ -177,6 +177,7 @@ MIME = {
     ".txt": "text/plain; charset=utf-8",
     ".mp4": "video/mp4",
     ".png": "image/png",
+    ".wav": "audio/wav",
     ".svg": "image/svg+xml",
 }
 

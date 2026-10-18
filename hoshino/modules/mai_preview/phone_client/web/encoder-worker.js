@@ -72,13 +72,23 @@ const CHART_DIFF = Q.get('diff') || '';
 // 音轨码率。音轨是主线程解码好、把 PCM 递进来的（Worker 里没有 AudioContext，
 // 解不了 mp3），这里只负责把 PCM 编成 AAC 塞进同一个 MP4。
 const AUDIO_BITRATE = qnum(['abitrate'], 128000, 32e3);
-// 正解音（打点音效）音量，0 = 关。默认 0.45 —— 明显听得到，又不盖音乐。
+// 正解音（打点音效）音量，0 = 关。
+// 默认 0.6 是照抄上游的「正解音音量」默认值（`soundVolume: .6`）；
+// 上游同时把音乐压到 `musicVolume: .8`，为了保持两者比例不变，
+// 下面 MUSIC_GAIN 也照抄 0.8。想和网页播放器听感一致就别单独调这两个。
 const SE_VOL = (() => {
   const raw = (Q.get('se') || '').trim().toLowerCase();
   if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 0;
   const n = Number(raw);
   if (raw !== '' && isFinite(n) && n > 0) return Math.min(1, n);
-  return 0.45;
+  return 0.6;
+})();
+// 音乐音量。上游默认 0.8，这里保持一致；se=0 时不压音乐，避免无声片变小声。
+const MUSIC_GAIN = (() => {
+  const raw = (Q.get('music') || '').trim().toLowerCase();
+  const n = Number(raw);
+  if (raw !== '' && isFinite(n) && n >= 0) return Math.min(1, n);
+  return SE_VOL > 0 ? 0.8 : 1.0;
 })();
 // bundle 用的 query：优先用服务器显式给的 bundle，否则自己按参数拼。
 // 这两个参数就是 render-bundle.js 唯一的输入面（谱面 id、难度槽位、画布尺寸、HUD 开关）。
@@ -265,30 +275,110 @@ self.addEventListener('message', (ev) => {
  *
  * 这也是为什么下面的换算里看不到 aacDelayMs —— 不是漏了，是消掉了。
  */
-const SE_MS = 55;                    // 打点音时长，够脆不拖尾
+/* ------------------------------------------------------------------ *
+ * 正解音：直接用上游 lxns 谱面预览播放器的 answer.wav 真采样
+ *
+ * 早期版本是在这里用正弦波合成的（1750Hz + 指数衰减 + 噪声瞬态）。那个
+ * 能听出「有打点音」，但和 https://maimai.lxns.net/chart 播放器的声音
+ * 明显不一样 —— 上游是录好的采样：
+ *
+ *   /assets/maimai/chart/answer.wav
+ *   pcm_s16le · 48000Hz · 单声道 · 0.4022s · 38658 字节
+ *   开头的 50ms 是数字静音，这是上游自己做的延迟对齐：它的取音函数里
+ *   写着 ANSWER_SOUND_BASE_OFFSET_MS = -50（音效比画面提前 50ms 播），
+ *   为了不改动采样本身，就在文件头上留了 50ms 空白来抵消，
+ *   实际发声从第 50.00ms 起、峰值在 52.4ms。
+ *
+ * 所以直接用这个文件，什么偏移都不用再加 —— 空白已经在采样里了。
+ * 文件跟渲染页放同一个目录（worker.html 旁边），同源 fetch 没有 CORS 问题。
+ * ------------------------------------------------------------------ */
+const SE_FILE = 'answer.wav';
 
-function buildSeWave(sr) {
-  const n = Math.max(1, Math.round(sr * SE_MS / 1000));
-  const w = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const t = i / sr;
-    const env = Math.exp(-t / 0.012);              // 12ms 指数衰减
-    const attack = Math.min(1, t / 0.0015);        // 1.5ms 起音，避免爆音
-    const tone = Math.sin(2 * Math.PI * 1750 * t) * 0.60
-               + Math.sin(2 * Math.PI * 3500 * t) * 0.25;
-    const click = (Math.random() * 2 - 1) * Math.exp(-t / 0.003) * 0.35;
-    w[i] = (tone + click) * env * attack;
+/** 手搓一个 WAV(PCM16) 解析器。
+ *
+ *  为什么不 decodeAudioData：这个编码流程跑在 Worker 里，而 Worker 作用域
+ *  没有 AudioContext / OfflineAudioContext（实测 hasAudioContext === false），
+ *  解不了任何音频容器。但 WAV 是无压缩的，头里就写着格式和长度，
+ *  直接按 RIFF 切块读 data 段即可，几行代码的事。
+ *
+ *  @returns {Promise<Float32Array>} 与目标采样率对齐后的单声道波形
+ */
+async function loadSeWave(targetSr) {
+  const resp = await fetch(SE_FILE, { cache: 'no-store' });
+  if (!resp.ok) throw new Error(`取 ${SE_FILE} 失败 HTTP ${resp.status}`);
+  const buf = await resp.arrayBuffer();
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46464952) throw new Error(`${SE_FILE} 不是 RIFF`);
+
+  // 顺序遍历所有 chunk，找到 fmt 和 data（顺序不保证，也不能假设固定偏移）
+  let pos = 12, fmt = null, dataOff = -1, dataLen = 0;
+  while (pos + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(dv.getUint8(pos), dv.getUint8(pos + 1),
+                                   dv.getUint8(pos + 2), dv.getUint8(pos + 3));
+    const size = dv.getUint32(pos + 4, true);
+    const body = pos + 8;
+    if (id === 'fmt ') {
+      fmt = {
+        audioFormat: dv.getUint16(body, true),
+        channels: dv.getUint16(body + 2, true),
+        sampleRate: dv.getUint32(body + 4, true),
+        bitsPerSample: dv.getUint16(body + 14, true),
+      };
+    } else if (id === 'data') {
+      dataOff = body;
+      dataLen = Math.min(size, buf.byteLength - body);
+      break;
+    }
+    pos = body + size + (size & 1);        // chunk 按 2 字节对齐
   }
-  return w;
+  if (!fmt || dataOff < 0) throw new Error(`${SE_FILE} 缺 fmt/data 段`);
+  if (fmt.audioFormat !== 1 || fmt.bitsPerSample !== 16) {
+    throw new Error(`${SE_FILE} 不是 PCM16（format=${fmt.audioFormat} bits=${fmt.bitsPerSample}）`);
+  }
+
+  const ch = Math.max(1, fmt.channels);
+  const nFrames = Math.floor(dataLen / (2 * ch));
+  const src = new Float32Array(nFrames);
+  for (let i = 0; i < nFrames; i++) {
+    let acc = 0;
+    for (let c = 0; c < ch; c++) {
+      acc += dv.getInt16(dataOff + (i * ch + c) * 2, true) / 32768;
+    }
+    src[i] = acc / ch;                     // 上游是单声道，这里只是兜底
+  }
+
+  // 采样率跟音轨对齐。上游正好 48000，和 AudioContext 的 44100/48000
+  // 常见取值一般能对上，对不上就线性插值一次（打点音几十毫秒，
+  // 插值带来的音色差异远小于重采样省下的复杂度）。
+  if (fmt.sampleRate === targetSr) return src;
+  const ratio = fmt.sampleRate / targetSr;
+  const out = new Float32Array(Math.max(1, Math.floor(nFrames / ratio)));
+  for (let i = 0; i < out.length; i++) {
+    const p = i * ratio, j = Math.floor(p), f = p - j;
+    const a = src[j] || 0, b = src[j + 1] || a;
+    out[i] = a + (b - a) * f;
+  }
+  return out;
 }
 
-/** 把谱面命中时刻换算成「输入 PCM 的采样下标」，越界剔掉。
+/** 采样文件开头那段数字静音的长度（采样点数见下文说明）。
+ *
+ *  上游的做法是「把采样提前 50ms 播，让文件自带的 50ms 空白落在音符之前」，
+ *  净效果是发声点正好压在音符上。我们这边是整段写进 PCM，写的位置就是文件
+ *  开头的位置，所以要主动把这 50ms 减掉，否则打点音会晚半个节拍的一小截。
+ */
+const SE_LEAD_MS = 50;
+
+/** 把谱面命中时刻换算成「输入 PCM 的采样下标」。
  *
  *  去重：同一时刻的多个音符（和弦、同时触摸）只发一个打点音。
  *  这不是偷工减料 —— 一是和弦在真机上本来就是一记「一起打」的声音，
- *  二是 N 个同相位的波直接相加会让 N=2 时到 0.9、N=3 时过 1.0 削顶，
+ *  二是 N 个同相位的采样直接相加会让 N=2 时到 0.9、N=3 时过 1.0 削顶，
  *  出来是刺耳的破音。实测 11818 槽5 有 1368 个音符但只有 936 个不同时刻，
  *  三成以上是同时按，不做去重音质会明显发毛。
+ *
+ *  返回值允许为负（开头那几个音符减掉 SE_LEAD_MS 后会小于 0）—— 混音时
+ *  负下标会自然跳过采样开头的静音部分，声音照样落在正确位置，不能丢事件。
  */
 const SE_MERGE_MS = 12;              // 12ms 内的算同一次按键
 
@@ -300,8 +390,7 @@ function seSamplePositions(hits, sr, leadMs, limitSamples) {
   for (let k = 0; k < hits.length; k++) {
     const h = hits[k];
     if (!Number.isFinite(h)) continue;
-    const posMs = h - leadMs;
-    if (posMs < 0) continue;
+    const posMs = h - leadMs - SE_LEAD_MS;
     const idx = Math.round(posMs / 1000 * sr);
     if (idx >= limitSamples) break;              // hits 已排序，后面都更晚
     if (idx - last < mergeIdx) continue;         // 与上一次按键太近，并进上一记
@@ -492,14 +581,14 @@ async function run() {
           const hits = (typeof api.hitTimes === 'function') ? api.hitTimes() : null;
           if (hits && hits.length) {
             hits.sort((x, y) => x - y);          // notes 数组不保证有序，先去排
-            seWave = buildSeWave(sr);
+            seWave = await loadSeWave(sr);
             sePos = seSamplePositions(hits, sr, leadMs, needSamples);
-            post({ note: `正解音：${hits.length} 个音符 → ${sePos.length} 记打点（音量 ${(SE_VOL * 100).toFixed(0)}%）` });
+            post({ note: `正解音：${hits.length} 个音符 → ${sePos.length} 记打点（answer.wav ${(seWave.length / sr * 1000).toFixed(0)}ms，音量 ${(SE_VOL * 100).toFixed(0)}%）` });
           } else {
             post({ note: '正解音：渲染器未提供命中时刻，跳过' });
           }
         } catch (e) {
-          post({ note: '正解音准备失败（不影响成片）：' + ((e && e.message) || e) });
+          post({ note: '正解音准备失败（不影响成片，音乐会正常保留）：' + ((e && e.message) || e) });
         }
       }
 
@@ -512,18 +601,21 @@ async function run() {
           const src = audioPcm.channels[c];
           for (let i = 0; i < n; i++) {
             const audioIdx = off + i;
-            buf[i * nch + c] = (audioIdx < src.length) ? src[audioIdx] : 0;
+            buf[i * nch + c] = (audioIdx < src.length) ? src[audioIdx] * MUSIC_GAIN : 0;
           }
         }
         // 混入本帧覆盖到的正解音。sePos 单调递增，用一个指针顺序扫，
         // 不重复遍历 —— 整支几千次命中也不会让编码变慢。
+        // sePos 可能有负数（开头那几记减掉样例前导后落在 0 之前），
+        // 这里靠 wi = i - start 自动跳过采样前面那截，不需要特殊处理。
         if (seWave && sePos) {
-          while (seIdx < sePos.length && sePos[seIdx] < off) seIdx++;
+          while (seIdx < sePos.length && sePos[seIdx] + seWave.length <= off) seIdx++;
           for (let k = seIdx; k < sePos.length; k++) {
             const p = sePos[k];
-            if (p >= off + n) break;
-            const start = p - off;
-            for (let i = Math.max(0, start); i < n; i++) {
+            if (p >= off + n) break;             // 已按位置排序，后面都更晚
+            const start = p - off;               // 相对本帧的下标，可能为负
+            const i0 = Math.max(0, start);
+            for (let i = i0; i < n; i++) {
               const wi = i - start;
               if (wi >= seWave.length) break;
               const v = seWave[wi] * SE_VOL;

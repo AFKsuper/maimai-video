@@ -128,6 +128,37 @@ ffmpeg 不在 PATH 时，在 `config.py` 里写死 `FFMPEG = r'C:\...\ffmpeg.exe
 
 ---
 
+## 难度槽位对照（对标 lxns 查分器）
+
+许多用户对比 [lxns 舞萌查分器谱面预览](https://maimai.lxns.net/chart) 时容易混淆难度传参，两者的槽位对应关系如下：
+
+| lxns 网页难度 | lxns 参数 | maidata 槽位 | 插件指令难度 | 说明 |
+|---|---|---|---|---|
+| **BASIC** | `difficulty=0` | `2` / `inote_2` | `绿` / `Basic` / `2` | 基础难度，音符较为稀疏 |
+| **ADVANCED** | `difficulty=1` | `3` / `inote_3` | `黄` / `Advanced` / `3` | 进阶难度 |
+| **EXPERT** | **`difficulty=2`** | **`4` / `inote_4`** | **`红` / `Expert` / `4`** | **在 lxns 上选 difficulty=2 时，对应的就是红谱 Expert** |
+| **MASTER** | `difficulty=3` | `5` / `inote_5` | `紫` / `Master` / `5` | 大师难度 |
+| **Re:MASTER** | `difficulty=4` | `6` / `inote_6` | `白` / `Re:Master` / `6` | 白谱（若有） |
+
+> **提示**：若你在 lxns 页面上查看的是 `difficulty=2`（如 11818 Expert 13.1），在 QQ 群中请发送 **`谱面确认 11818 红`** 或 **`谱面确认 11818 4`**。若输入 `2` 则会渲染出对应的绿谱 Basic 7.8。
+
+---
+
+## 音画毫秒级对齐与渲染特性
+
+1. **绝对音画同步（数学级对齐）**：
+   - 谱面引擎在解析 maidata 时强制加入了 1 个小节（4 拍）的前导时间：$\text{leadInMs} = \frac{60000 \times 4}{\text{firstBpm}}$。画面在 $t = \text{leadInMs}$ 时首个音符刚好击中判定线。
+   - 官方 MP3 音频的第一拍发生时刻由谱面元数据 `&first=`（秒）决定。
+   - 手机端编码与服务器补轨均精准计算前置静音延时：$\text{delayMs} = \text{leadInMs} - \text{firstMs}$。
+   - **成片效果**：第 0 帧画面完整保留音符从圆心飞向外圈判定线的入场动画；在 $t = \text{delayMs}$ 击打发生的瞬间，音乐第一拍主声浪分毫不差震撼敲响，实现 **0 毫秒误差的绝对同步**。
+2. **曲绘暗色大圆盘背景**：
+   - 自动装载曲目封面图 `bg.png` 并施加半透明暗色裁切遮罩，彻底告别单调黑屏，还原街机与 lxns 同款大圆盘质感。
+3. **100% 手机端算力与存储**：
+   - 逐帧离散步进 Canvas 渲染与 H.264 / AAC 编码完全运行在手机 Chrome 的 WebCodecs（GPU 硬编）中；
+   - 成片直接写入手机存储 `/sdcard/Download/maimai/`，云服务器不消耗任何 GPU 算力与视频存储空间。
+
+---
+
 ## 用法
 
 群里发送：

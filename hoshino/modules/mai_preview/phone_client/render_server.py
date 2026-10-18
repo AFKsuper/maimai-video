@@ -158,6 +158,7 @@ def _load_bridge_from_config() -> None:
 # 不允许任何路径分隔符 —— 这是唯一一道防目录穿越的闸门。
 NAME_RE = re.compile(r"^[0-9]{1,12}_[0-9]{1,2}(_[^/\\:*?\"<>|]{0,80})?\.mp4$")
 CHART_RE = re.compile(r"^/charts/([0-9]{1,12})(?:\.txt|/maidata\.txt)$")
+BG_RE = re.compile(r"^(?:/charts/([0-9]{1,12})/bg\.png|/bg/([0-9]{1,12})\.png)$")
 AUDIO_RE = re.compile(r"^/audio/([0-9]{1,12})\.mp3$")
 MAX_BYTES = 512 * 1024 * 1024   # 单支上限 512MB，防止误传把盘写满
 
@@ -450,6 +451,19 @@ class RenderHandler(BaseHTTPRequestHandler):
                 self._send_bytes(data, "audio/mpeg")
             else:
                 self._plain(404, "audio not found")
+            return
+
+        # 曲绘背景：本地优先，支持同源加载
+        m_bg = BG_RE.match(path)
+        if m_bg:
+            chart_id = m_bg.group(1) or m_bg.group(2)
+            bg_path = os.path.join(HERE, "web", "bg", f"{chart_id}.png")
+            alt_bg = os.path.join("/sdcard/Download/maimai_bg", f"{chart_id}.png")
+            p = bg_path if os.path.isfile(bg_path) else (alt_bg if os.path.isfile(alt_bg) else None)
+            if p:
+                self._send_file(p)
+                return
+            self._plain(404, "bg not found")
             return
 
         # 静态文件

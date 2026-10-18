@@ -157,8 +157,8 @@ def _catalog_add(chart_id: str, title: str, text: str, chart_root: str) -> None:
     except Exception as exc:
         print(f"警告：catalog.json 补写失败 {chart_id}: {exc}", file=sys.stderr)
 
-# /charts/<id>.txt 与 /charts/<id>/maidata.txt 两种写法
-CHART_RE = re.compile(r"^/charts/([0-9]+)(?:\.txt|/maidata\.txt)$")
+# /charts/<id>.txt 与 /charts/<id>/<asset> 支持
+CHART_ASSET_RE = re.compile(r"^/charts/([0-9]+)(?:/([a-zA-Z0-9_\-\.]+)|(?:\.txt))?$")
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -222,7 +222,34 @@ class PreviewHandler(BaseHTTPRequestHandler):
     def _reject_method(self) -> None:  # noqa: N802
         self._plain(405, "method not allowed")
 
-    do_POST = _reject_method
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        if parsed.path == "/api/save_raw":
+            try:
+                from urllib.parse import parse_qs
+                qs = parse_qs(parsed.query)
+                name = qs.get("name", ["raw_video.mp4"])[0]
+                # 限制文件名
+                name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
+                out_dir = os.path.join(ROOT, "output")
+                os.makedirs(out_dir, exist_ok=True)
+                target = os.path.join(out_dir, name)
+                length = int(self.headers.get("Content-Length", 0))
+                remaining = length
+                with open(target, "wb") as f:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(remaining, 64 * 1024))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                res = json.dumps({"ok": True, "path": target, "bytes": os.path.getsize(target)})
+                self._plain(200, res, "application/json")
+                return
+            except Exception as e:
+                self._plain(500, json.dumps({"ok": False, "error": str(e)}), "application/json")
+                return
+        self._reject_method()
     do_PUT = _reject_method
     do_DELETE = _reject_method
     do_PATCH = _reject_method
@@ -330,21 +357,23 @@ class PreviewHandler(BaseHTTPRequestHandler):
             self._plain(200, "ok")
             return
 
-        # 2) 谱面路由（short_id 经 id2dir.json 映射到曲名文件夹）
-        m = CHART_RE.match(path)
+        # 2) 谱面与资源路由（short_id 经 id2dir.json 映射到曲名文件夹）
+        m = CHART_ASSET_RE.match(path)
         if m:
             chart_id = m.group(1)
+            filename = m.group(2) or "maidata.txt"
             rel_dir = ID2DIR.get(chart_id, chart_id)
-            full = resolve_inside(self.chart_root, os.path.join(rel_dir, "maidata.txt"))
+            full = resolve_inside(self.chart_root, os.path.join(rel_dir, filename))
             if full and os.path.isfile(full):
                 self._send_file(full)
                 return
-            # 本地没有 -> 远端懒加载（拉回落盘，下次离线可用）
-            target_dir = _lazy_fetch(chart_id, self.chart_root)
-            if target_dir:
-                self._send_file(os.path.join(target_dir, "maidata.txt"))
-            else:
-                self._plain(404, "not found")
+            # 只有 maidata.txt 缺失才触发懒加载
+            if filename == "maidata.txt":
+                target_dir = _lazy_fetch(chart_id, self.chart_root)
+                if target_dir:
+                    self._send_file(os.path.join(target_dir, "maidata.txt"))
+                    return
+            self._plain(404, "not found")
             return
 
         # 3) 曲目元数据路由（提供 catalog.json 与移动端专用的 catalog-lite.json）

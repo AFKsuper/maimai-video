@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Offline Chart Renderer</title>
+  <style>
+    body { background: #0b0c10; color: #66fcf1; font-family: monospace; padding: 20px; }
+    #prog { font-size: 18px; margin-top: 10px; }
+    canvas { display: block; margin: 10px 0; border: 1px solid #1f2833; }
+  </style>
+</head>
+<body>
+  <h2>Maimai Offline Render Engine</h2>
+  <div id="status">正在准备引擎...</div>
+  <div id="prog">0 / 0 (0%)</div>
+  <canvas id="canvas" width="720" height="720"></canvas>
+
+  <script type="module">
+    import { Muxer, ArrayBufferTarget } from './vendor_mp4_muxer.mjs';
+
+    const Q = new URLSearchParams(location.search);
+    const CHART_ID = Q.get('id') || '11818';
+    const CHART_DIFF = Number(Q.get('diff') || '4');
+    const PX = Number(Q.get('px') || '720');
+    const FPS = Number(Q.get('fps') || '60');
+    const BITRATE = Number(Q.get('bitrate') || '6000000');
+    const HI_SPEED = Number(Q.get('hispeed') || '6');
+
+    const statusEl = document.getElementById('status');
+    const progEl = document.getElementById('prog');
+    const canvas = document.getElementById('canvas');
+    canvas.width = PX;
+    canvas.height = PX;
+
+    window.__renderResult = null;
+    window.__renderProgress = { phase: 'init', current: 0, total: 0 };
+
+    async function main() {
+      try {
+        statusEl.textContent = `加载谱面数据 (id: ${CHART_ID}, diff: ${CHART_DIFF})...`;
+        // 动态引入 render-bundle
+        const script = document.createElement('script');
+        script.src = `./render-bundle.js?id=${CHART_ID}&diff=${CHART_DIFF}&size=${PX}&dpr=1&hud=0&hiSpeed=${HI_SPEED}`;
+        document.body.appendChild(script);
+
+        // 等待 api 就绪
+        while (!window.__chartPreview || !window.__chartPreview.ready) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+        const api = window.__chartPreview;
+        const info = await api.ready;
+        statusEl.textContent = `谱面已就绪: ${info.chartId} (diff ${info.diff}, BPM ${info.bpm}, 时长 ${(info.totalMs/1000).toFixed(1)}s)`;
+
+        // 加载背景曲绘图
+        try {
+          const img = new Image();
+          img.src = `/charts/${CHART_ID}/bg.png`;
+          await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = () => resolve(); // 允许背景缺失
+          });
+          if (img.complete && img.naturalWidth > 0) {
+            api.setBackgroundImage(img);
+            statusEl.textContent += ` [背景曲绘已装载]`;
+          }
+        } catch (e) {
+          console.warn('背景图加载跳过:', e);
+        }
+
+        api.setSize(PX, 1);
+        api.setOption('hiSpeed', HI_SPEED);
+
+        // 配置编码器
+        const totalFrames = Math.ceil(info.totalMs / 1000 * FPS);
+        window.__renderProgress.total = totalFrames;
+        statusEl.textContent = `开始逐帧离线渲染: 总计 ${totalFrames} 帧 (@${FPS}fps)...`;
+
+        const muxer = new Muxer({
+          target: new ArrayBufferTarget(),
+          video: {
+            codec: 'avc',
+            width: PX,
+            height: PX,
+            frameRate: FPS,
+          },
+          fastStart: 'in-memory',
+        });
+
+        let encErr = null;
+        const encoder = new VideoEncoder({
+          output: (chunk, meta) => {
+            muxer.addVideoChunk(chunk, meta);
+          },
+          error: (e) => {
+            encErr = e;
+            console.error('VideoEncoder error:', e);
+          }
+        });
+
+        async function getBestConfig() {
+          const candidates = [
+            { codec: 'avc1.640028', hardwareAcceleration: 'prefer-hardware' },
+            { codec: 'avc1.640028', hardwareAcceleration: 'no-preference' },
+            { codec: 'avc1.4D401F', hardwareAcceleration: 'no-preference' },
+            { codec: 'avc1.42E01E', hardwareAcceleration: 'no-preference' },
+            { codec: 'avc1.42E01E', hardwareAcceleration: 'prefer-software' },
+          ];
+          for (const cand of candidates) {
+            const cfg = {
+              codec: cand.codec,
+              width: PX,
+              height: PX,
+              bitrate: BITRATE,
+              framerate: FPS,
+              hardwareAcceleration: cand.hardwareAcceleration,
+              latencyMode: 'quality',
+            };
+            try {
+              const res = await VideoEncoder.isConfigSupported(cfg);
+              if (res.supported) {
+                console.log('Selected video config:', res.config);
+                return res.config;
+              }
+            } catch (e) {
+              console.warn('Config check failed for', cand, e);
+            }
+          }
+          throw new Error('本机不支持任何可用的 H.264 编码配置');
+        }
+
+        const chosenConfig = await getBestConfig();
+        statusEl.textContent += ` [编码配置: ${chosenConfig.codec} (${chosenConfig.hardwareAcceleration})]`;
+
+        encoder.configure(chosenConfig);
+
+        const tStart = performance.now();
+        const FLUSH_EVERY = FPS;
+
+        for (let i = 0; i < totalFrames; i++) {
+          if (encErr) throw encErr;
+
+          const frameMs = i * 1000 / FPS;
+          api.renderMs(frameMs);
+
+          const frame = new VideoFrame(canvas, {
+            timestamp: Math.round(i * 1e6 / FPS),
+            duration: Math.round(1e6 / FPS),
+          });
+          encoder.encode(frame, { keyFrame: i % (FPS * 2) === 0 });
+          frame.close();
+
+          if ((i + 1) % FLUSH_EVERY === 0) {
+            await encoder.flush();
+          }
+
+          if ((i + 1) % 30 === 0 || i === totalFrames - 1) {
+            const pct = ((i + 1) / totalFrames * 100).toFixed(1);
+            const fpsSpeed = ((i + 1) / ((performance.now() - tStart) / 1000)).toFixed(0);
+            progEl.textContent = `${i + 1} / ${totalFrames} (${pct}%) - 渲染速度: ${fpsSpeed} FPS`;
+            window.__renderProgress.current = i + 1;
+            if ((i + 1) % 600 === 0 || i === totalFrames - 1) {
+              console.log(`[Render Progress] ${i + 1}/${totalFrames} (${pct}%) @ ${fpsSpeed} FPS`);
+            }
+          }
+        }
+
+        statusEl.textContent = '画面渲染完成，正在封装视频流...';
+        await encoder.flush();
+        encoder.close();
+
+        muxer.finalize();
+        const buffer = muxer.target.buffer;
+        const elapsed = ((performance.now() - tStart) / 1000).toFixed(1);
+        statusEl.textContent = `编码完成！总耗时: ${elapsed}s, 视频大小: ${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB`;
+
+        // 传递给后端保存
+        const resp = await fetch('/api/save_raw?name=' + encodeURIComponent(`raw_${CHART_ID}_${CHART_DIFF}.mp4`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'video/mp4' },
+          body: buffer,
+        });
+        const saveRes = await resp.json();
+        console.log('[Render Finished and Saved]', saveRes);
+        statusEl.textContent += ` -> 落盘成功: ${saveRes.path}`;
+        window.__renderResult = { ok: true, path: saveRes.path, info, totalFrames, durationSec: totalFrames / FPS };
+      } catch (err) {
+        console.error('Render error:', err);
+        statusEl.textContent = `渲染异常: ${err.message || err}`;
+        window.__renderResult = { ok: false, error: String(err) };
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>

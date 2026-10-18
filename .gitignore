@@ -17,3 +17,13 @@ phone_client/charts/*.txt
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本地渲染产物与大文件
+*.mp4
+*.png
+*.jpg
+node_modules/
+bin/
+package.json
+pnpm-lock.yaml
+hoshino/modules/mai_preview/server/output/

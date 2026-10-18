@@ -169,6 +169,30 @@ def catalog_audio_url(chart_id: str | int) -> Optional[str]:
     return None
 
 
+def catalog_timing_delay_ms(chart_id: str | int) -> int:
+    """计算该曲目音轨前置所需延时（毫秒），使音频第1拍与画面首音符判定点精准重合。"""
+    data = _load_catalog()
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not entries:
+        return 0
+    want = str(chart_id).strip()
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("slug") or "").strip() != want and str(e.get("id") or "").strip() != want:
+            continue
+        try:
+            bpm = float(e.get("bpm") or 0)
+            offset = float(e.get("offset") or 0) # 秒
+            if bpm > 0:
+                lead_in_ms = (60000.0 * 4.0) / bpm
+                first_ms = offset * 1000.0
+                return max(0, int(round(lead_in_ms - first_ms)))
+        except (ValueError, TypeError):
+            pass
+    return 0
+
+
 # ---------------------------------------------------------------- 音频缓存
 
 
@@ -310,13 +334,17 @@ def apply_audio(
 
     part = video_path + ".muxing.mp4"
     bitrate = str(_cfg("PHONE_AUDIO_BITRATE", "128k") or "128k")
+    delay_ms = catalog_timing_delay_ms(chart_id)
+    filter_complex = f"[1:a]adelay={delay_ms}|{delay_ms},apad[a]" if delay_ms > 0 else "[1:a]apad[a]"
     cmd = [
         ffmpeg, "-y", "-v", "error",
         "-i", video_path,
         "-i", audio,
-        "-map", "0:v:0", "-map", "1:a:0",
+        "-filter_complex", filter_complex,
+        "-map", "0:v:0", "-map", "[a]",
         "-c:v", "copy",            # 画面直接透传，不重编码、不损画质
         "-c:a", "aac", "-b:a", bitrate,
+        "-shortest",
         "-movflags", "+faststart",
         part,
     ]

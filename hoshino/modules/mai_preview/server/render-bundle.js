@@ -8359,6 +8359,12 @@
       if (!canvas) throw new Error("\u9875\u9762\u7F3A\u5C11 #canvas \u5143\u7D20");
       return canvas.toDataURL("image/png");
     },
+    setBackgroundImage(img) {
+      if (renderer) renderer.setBackgroundImage(img);
+    },
+    setBackgroundVideo(video) {
+      if (renderer) renderer.setBackgroundVideo(video);
+    },
     /** 本地扩展：离线编码器可直接指定像素尺寸并立即重绘当前帧。 */
     setSize(size, dpr2 = 1) {
       if (!renderer || !chart) throw new Error("\u6E32\u67D3\u5668\u5C1A\u672A\u5C31\u7EEA");
@@ -8381,7 +8387,8 @@
         difficulties: availableDiffs,
         bpm: chart.bpm,
         totalBeats: totalBeatsOf(chart),
-        totalMs: totalMsOf(chart)
+        totalMs: totalMsOf(chart),
+        firstMs: Number.isFinite(chart.firstMs) ? chart.firstMs : 0
       };
     }
   };

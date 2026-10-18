@@ -372,12 +372,13 @@ function diffRatio(a, b) {
 }
 
 /* 预扫：在不编码的情况下把开头的画面快速渲染一遍，找出「谱面开始动」的时刻。
- * 必须先扫再编 —— 编码是不可回退的，一旦某一帧没叠提示层就补不回来了。 */
-function detectIntroEnd(api, totalMs) {
+ * 必须先扫再编 —— 编码是不可回退的，一旦某一帧没叠提示层就补不回来了。
+ * offsetMs：与主循环完全一致的渲染偏移，保证两边扫的是同一批谱面帧。 */
+function detectIntroEnd(api, totalMs, offsetMs) {
   const limit = Math.min(totalMs, DETECT_MAX_MS);
   let baseline = null;
   for (let ms = 0; ms <= limit; ms += DETECT_STEP_MS) {
-    api.renderMs(ms);
+    api.renderMs(Math.max(0, ms + offsetMs));
     const px = grabSmall();
     if (baseline === null) {
       baseline = px;
@@ -573,16 +574,46 @@ async function run() {
     /* 允许背景加载失败回退 */
   }
 
-  // 音画毫秒级对齐数学模型：
-  // 1. render-bundle.js 在解析谱面时给全谱加入了 4 拍的前导时间：leadMs = (60000 * 4) / firstBpm。
-  //    画面在 t = leadMs 时刻，第一个音符刚好砸中判定线。
-  // 2. 谱面 maidata 中的 &first 决定了音频第 1 拍发生的时间：firstMs = firstSec * 1000。
-  // 3. 画面必须从 t = 0 正常开始渲染，以完整保留 0~leadMs 开场倒数与音符飞入动画。
-  // 4. 音频必须延后 delayMs = leadMs - firstMs 开始播放，使音乐的第一拍与画面的首个 Note 击打瞬间 0 误差重合。
+  // 音画毫秒级对齐：把 render-bundle 自己加的 4 拍前导抵消掉。
+  //
+  // render-bundle.js:7448-7456 在解析完谱面后做了这件事：
+  //   const leadInMs = 60000 * 4 / firstBpm;
+  //   note.timingMs += leadInMs;   // 全谱音符整体后移 1 小节
+  // 它服务的那个网页播放器是「先留 1 小节画面准备期、再起音乐」的，
+  // 所以在那边音乐也是从 leadInMs 才开始排。
+  //
+  // 但我们喂的是官方 track.mp3，从 0 秒原样播放。而谱面时间轴 0 秒
+  // 与音轨 0 秒本来就是同一个时刻 —— 实测 mp3 首次出声与首音符时刻：
+  //   11818  1170.7 / 1170.7   10030 1401.6 / 1403.5
+  //   11303  1318.2 / 1318.7   11629 1309.8 / 1311.5   差都 < 2ms
+  // 所以那 1 小节是该被抵消掉的，不能留在画面里。
+  //
+  // 抵消方式：不动 vendor bundle（改它风险大），改为把渲染时钟整体前移
+  // leadMs —— 即视频第 0 秒去渲染谱面第 leadMs 毫秒。这样
+  //   视频 t=0  ==  谱面 0 秒  ==  音轨 0 秒
+  // 三者同源，音轨原样从头播，既不吃掉开头，也不截掉片尾。
   const leadMs = info.bpm > 0 ? (6e4 * 4) / info.bpm : 0;
-  const firstMs = Number.isFinite(info.firstMs) ? info.firstMs : 0;
-  const delayMs = Math.max(0, leadMs - firstMs);
-  post({ note: `音画对齐计算：leadMs=${leadMs.toFixed(1)}ms, firstMs=${firstMs.toFixed(1)}ms -> 音频前置静音 delayMs=${delayMs.toFixed(1)}ms` });
+  post({ note: `音画对齐：抵消 render-bundle 前导 leadMs=${leadMs.toFixed(1)}ms（音轨不延迟）` });
+
+  // AAC 编码器预置延迟（第二层修正）。
+  //
+  // AudioEncoder 编 AAC 时会在流首插入 2048 个采样的编码器延迟（priming）。
+  // 标准做法是在 MP4 里写 edit list 把这段跳过，但 vendor_mp4_muxer 不支持
+  // edit list（grep elst/edts 均无命中），所以解出来的音轨整体后移了
+  // 2048 / sampleRate 秒。实测 11818：源 mp3 首声 1170.7ms，成片音轨首声
+  // 1213.4ms，差 42.7ms = 2048/48000，与此完全吻合。
+  //
+  // 既然改不了音频，就把画面也往同一方向挪 —— 让「视频第 t 秒」去渲染
+  // 「谱面第 t + leadMs - aacDelayMs 毫秒」的帧。这样在任意 t 处：
+  //   画面内容时刻 == 音轨内容时刻
+  // 两者一起平移，相对关系严格保持，人眼/人耳感知到的音画差为 0。
+  // 代价只有开头 42.7ms 画面会停在谱面 0 秒（此时音轨正好是那段静音），
+  // 以及结尾少 42.7ms —— 都不可感知。
+  const aacDelayMs = audioPcm ? (2048 / audioPcm.sampleRate) * 1000 : 0;
+  const renderOffsetMs = leadMs - aacDelayMs;
+  if (aacDelayMs > 0) {
+    post({ note: `音画对齐：再扣 AAC 预置延迟 ${aacDelayMs.toFixed(1)}ms（2048 采样）` });
+  }
 
   // 时长的取法（这一行决定了成片的音画是否对齐）：
   //
@@ -627,8 +658,8 @@ async function run() {
       const sr = audioPcm.sampleRate;
       const nch = audioPcm.numberOfChannels;
       const totalSamples = audioPcm.channels[0].length;
-      const delaySamples = Math.max(0, Math.round((delayMs / 1000) * sr));
-      const totalAudioSamples = totalSamples + delaySamples;
+      // 音轨原样从 0 秒播 → 不补前置静音（画面那 1 小节前导已由 leadMs 抵消）
+      const totalAudioSamples = totalSamples;
       // 音轨只要覆到画面结束就够，多出来的截掉，免得容器被拉长
       const needSamples = Math.min(totalAudioSamples, Math.ceil(totalMs / 1000 * sr));
       const FRAME = 1024;                       // AAC 帧长固定 1024 采样
@@ -639,8 +670,8 @@ async function run() {
         for (let c = 0; c < nch; c++) {
           const src = audioPcm.channels[c];
           for (let i = 0; i < n; i++) {
-            const audioIdx = (off + i) - delaySamples;
-            buf[i * nch + c] = (audioIdx >= 0 && audioIdx < src.length) ? src[audioIdx] : 0;
+            const audioIdx = off + i;
+            buf[i * nch + c] = (audioIdx < src.length) ? src[audioIdx] : 0;
           }
         }
         const ad = new AudioData({
@@ -730,16 +761,16 @@ async function run() {
   // 空场期到哪儿结束：先在不编码的情况下快速预扫一遍，找出「谱面开始动」的时刻。
   // 检测不到（整支都没音符）就返回 0，行为与改动前完全一致。
   setPhase('scanning');
-  const introEndMs = detectIntroEnd(api, totalMs);
+  const introEndMs = detectIntroEnd(api, totalMs, renderOffsetMs);
 
   for (let i = 0; i < totalFrames; i++) {
     if (encErr) throw encErr;
 
     const tMs = i * 1000 / FPS;
     const tr = performance.now();
-    // 画面从 tMs = 0 正常推进，开场 0~leadMs 留白与飞键动画完整呈现；
-    // 音频在上面已经通过前置静音 delaySamples 实现了精确对齐。
-    api.renderMs(tMs);
+    // 视频 t 秒 → 谱面 (t + renderOffsetMs)，renderOffsetMs = 抵消前导的 leadMs
+    // 再减去 AAC 预置延迟，使「画面内容时刻 == 音轨内容时刻」。
+    api.renderMs(Math.max(0, tMs + renderOffsetMs));
     // 提示层叠在同一个 canvas 上，必须在 renderMs 之后、new VideoFrame 之前
     if (introEndMs > 0 && tMs < introEndMs) drawIntroOverlay(tMs, introEndMs);
     renderAcc += performance.now() - tr;

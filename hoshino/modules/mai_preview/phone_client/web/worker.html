@@ -243,8 +243,29 @@
       // 同源代理。src 用服务器下发的原始地址（它知道每首歌在哪个分片目录）。
       const proxy = `/audio/${encodeURIComponent(id)}.mp3?src=${encodeURIComponent(audioUrl)}`;
       const t0 = Date.now();
-      const r = await fetch(proxy);
-      if (!r.ok) throw new Error(`音轨下载失败 HTTP ${r.status}`);
+      // 拉音轨要重试：跑一夜批量时手机网络偶发抖一下（实测出现过
+      // `Failed to fetch` 和读超时），一次失败就让这支成片永久无声太亏。
+      // 代理端点本身在白名单/地址出错时会快速回 4xx，那种重试也没用，直接抛。
+      let r = null, lastErr = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          r = await fetch(proxy);
+          if (r.ok) { lastErr = null; break; }
+          if (r.status >= 400 && r.status < 500) {
+            throw new Error(`音轨下载失败 HTTP ${r.status}`);
+          }
+          lastErr = new Error(`音轨下载失败 HTTP ${r.status}`);
+        } catch (e) {
+          if (String(e && e.message || e).indexOf('HTTP 4') >= 0) throw e;
+          lastErr = e;
+        }
+        r = null;
+        if (attempt < 3) {
+          log(`  · 音轨下载失败，${attempt * 2}s 后重试（${attempt}/3）：${String((lastErr && lastErr.message) || lastErr)}`);
+          await new Promise((ok) => setTimeout(ok, attempt * 2000));
+        }
+      }
+      if (!r) throw lastErr || new Error('音轨下载失败');
       const buf = await r.arrayBuffer();
       const dlMs = Date.now() - t0;
       // decodeAudioData 会把传入的 ArrayBuffer「取用」掉（byteLength 归零），

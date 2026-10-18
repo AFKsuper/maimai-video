@@ -64,6 +64,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse, parse_qs, urlencode, urlsplit
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,11 @@ AUDIO_DIR = os.environ.get("MAIMAI_AUDIO_DIR", "/sdcard/Download/maimai_audio")
 # 开了个任意 URL 的代理。
 AUDIO_ALLOW_HOSTS = {"astrodx-charts.saop.cc", "adxdls.saop.cc"}
 AUDIO_TIMEOUT_S = 30
+AUDIO_TRIES = 3
+
+
+class _PermFail(Exception):
+    """音轨地址本身的永久性错误（4xx），不值得重试。"""
 
 HTML_PORT = int(os.environ.get("MAIMAI_HTML_PORT", "8777") or "8777")
 SAVE_PORT = int(os.environ.get("MAIMAI_SAVE_PORT", "8780") or "8780")
@@ -312,18 +318,15 @@ def _audio_url_allowed(url: str) -> bool:
     return host in AUDIO_ALLOW_HOSTS
 
 
-def fetch_remote_audio(chart_id: str, src: str) -> bytes | None:
-    """把音轨从远端拉一次并落盘。
+def _fetch_audio_once(chart_id: str, src: str, timeout_s: int, attempt: int) -> bytes | None:
+    """单次尝试。失败返回 None，由 fetch_remote_audio 决定要不要重试。
 
-    `src` 由服务器随任务下发（服务器有 catalog.json，知道每首歌的音轨在哪个
-    分片目录下，手机自己猜不出来）。只接受白名单域名。
+    4xx 是永久性错误（地址错了、文件没了），重试只是白等 —— 用
+    `_perm_fail` 标记直接放弃；超时、连接断开、5xx 才值得重试。
     """
-    if not _audio_url_allowed(src):
-        log("[audio] %s 拒绝非白名单地址: %s" % (chart_id, src[:120]))
-        return None
     try:
         req = Request(src, headers={"User-Agent": REMOTE_UA})
-        with urlopen(req, timeout=AUDIO_TIMEOUT_S) as r:
+        with urlopen(req, timeout=timeout_s) as r:
             if r.status != 200:
                 log("[audio] %s 远端返回 %s" % (chart_id, r.status))
                 return None
@@ -331,19 +334,55 @@ def fetch_remote_audio(chart_id: str, src: str) -> bytes | None:
         if len(data) < 4096:          # 太小基本是错误页，别当音轨缓存
             log("[audio] %s 内容过小（%d 字节），视为失败" % (chart_id, len(data)))
             return None
-        try:
-            os.makedirs(AUDIO_DIR, exist_ok=True)
-            tmp = audio_cache_path(chart_id) + ".part"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.replace(tmp, audio_cache_path(chart_id))
-        except OSError as e:
-            log("[audio] %s 落盘失败（不影响本次返回）: %s" % (chart_id, e))
-        log("[audio] %s 已从远端拉取并缓存（%d 字节）" % (chart_id, len(data)))
         return data
-    except Exception as e:
-        log("[audio] %s 拉取失败: %s" % (chart_id, e))
+    except HTTPError as e:
+        if 400 <= e.code < 500:
+            log("[audio] %s 远端返回 %s，地址不可用，不再重试" % (chart_id, e.code))
+            raise _PermFail()
+        log("[audio] %s 第 %d 次拉取失败: HTTP %s" % (chart_id, attempt, e.code))
         return None
+    except Exception as e:
+        log("[audio] %s 第 %d 次拉取失败: %s" % (chart_id, attempt, e))
+        return None
+
+
+def fetch_remote_audio(chart_id: str, src: str) -> bytes | None:
+    """把音轨从远端拉一次并落盘。
+
+    `src` 由服务器随任务下发（服务器有 catalog.json，知道每首歌的音轨在哪个
+    分片目录下，手机自己猜不出来）。只接受白名单域名。
+
+    **失败会重试**：音轨是几 MB 的 mp3，手机网络偶发读超时很常见（实测铺量时
+    出现过 `The read operation timed out`，那一支就成了无声片）。重试 3 次、
+    每次把超时放宽，比让用户听到无声视频划算。4xx 不重试。
+    """
+    if not _audio_url_allowed(src):
+        log("[audio] %s 拒绝非白名单地址: %s" % (chart_id, src[:120]))
+        return None
+    data = None
+    for attempt in range(1, AUDIO_TRIES + 1):
+        try:
+            data = _fetch_audio_once(chart_id, src, AUDIO_TIMEOUT_S * attempt, attempt)
+        except _PermFail:
+            return None
+        if data:
+            break
+        if attempt < AUDIO_TRIES:
+            log("[audio] %s 准备重试（%d/%d）" % (chart_id, attempt + 1, AUDIO_TRIES))
+            time.sleep(2)
+    if not data:
+        log("[audio] %s 重试 %d 次仍失败，本次成片将无声" % (chart_id, AUDIO_TRIES))
+        return None
+    try:
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+        tmp = audio_cache_path(chart_id) + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, audio_cache_path(chart_id))
+    except OSError as e:
+        log("[audio] %s 落盘失败（不影响本次返回）: %s" % (chart_id, e))
+    log("[audio] %s 已从远端拉取并缓存（%d 字节）" % (chart_id, len(data)))
+    return data
 
 
 # ---------------------------------------------------------------------------
